@@ -20,8 +20,9 @@ Python 3.9+, standard library only. macOS/Linux (it uses `fcntl` file locks).
 ./copilot_pool.py init
 ```
 
-- **Token**: a classic PAT with `repo` scope, or leave blank to use `gh auth token`.
-  (Fine-grained PATs can't act on repos owned by other users, which helpers need.)
+- **Auth** comes from the GitHub CLI: log in once with `gh auth login`. The script runs
+  `gh auth token` whenever it starts, and never stores the token. The default `gh` login includes the
+  `repo` scope it needs.
 - **Credits** are read from Copilot's own account endpoint (`/copilot_internal/user`), the same one
   the Copilot clients use. It works for personal plans and for seats paid by an organization, which
   GitHub's billing API doesn't cover. It is undocumented and could change. If it fails, the script

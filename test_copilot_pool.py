@@ -2,6 +2,7 @@ import base64
 import datetime as dt
 import json
 import os
+import subprocess
 import urllib.request
 
 import pytest
@@ -1155,6 +1156,41 @@ def test_redirect_strips_token_when_origin_changes(target, keeps_auth):
 
 
 # --- config --------------------------------------------------------------------
+
+
+def test_token_defaults_to_gh_cli(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="gho_abc\n", stderr="")
+
+    monkeypatch.setattr(cp.subprocess, "run", fake_run)
+    assert cp.Config(username="a", pool_repo=POOL, monthly_credits=1).resolve_token() == "gho_abc"
+    assert calls == ["gh auth token"]
+
+
+def test_explicit_token_still_honoured(monkeypatch):
+    monkeypatch.setattr(cp.subprocess, "run", lambda *a, **k: pytest.fail("should not shell out"))
+    assert cp.Config(username="a", pool_repo=POOL, monthly_credits=1, token="t").resolve_token() == "t"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        subprocess.CalledProcessError(1, "gh auth token", stderr="no oauth token"),
+        subprocess.CompletedProcess("gh auth token", 0, stdout="\n", stderr=""),
+    ],
+)
+def test_gh_token_failure_says_to_log_in(monkeypatch, result):
+    def fake_run(cmd, **kw):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(cp.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit, match="gh auth login"):
+        cp.Config(username="a", pool_repo=POOL, monthly_credits=1).resolve_token()
 
 
 def test_config_roundtrip_is_private(tmp_path):

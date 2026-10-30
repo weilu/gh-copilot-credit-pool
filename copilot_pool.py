@@ -18,7 +18,6 @@ import base64
 import contextlib
 import datetime as dt
 import fcntl
-import getpass
 import hashlib
 import json
 import logging
@@ -154,7 +153,7 @@ class Config:
     # Only used when the Copilot endpoint is unreachable; otherwise the entitlement comes from GitHub.
     monthly_credits: int
     token: str = ""
-    token_command: str = ""
+    token_command: str = "gh auth token"
     # Minimum credits a member needs to take on a review, and the local-count cost of one.
     credits_per_review: int = 100
     poll_interval: int = 60
@@ -189,11 +188,17 @@ class Config:
     def resolve_token(self):
         if self.token:
             return self.token
-        if self.token_command:
-            return subprocess.run(
+        try:
+            token = subprocess.run(
                 self.token_command, shell=True, check=True, capture_output=True, text=True
             ).stdout.strip()
-        raise SystemExit("No token configured; run `copilot_pool.py init`.")
+        except subprocess.CalledProcessError as e:
+            raise SystemExit(
+                f"`{self.token_command}` failed ({e.stderr.strip() or e}). Install the GitHub CLI and run `gh auth login`."
+            ) from None
+        if not token:
+            raise SystemExit(f"`{self.token_command}` printed no token. Run `gh auth login`.")
+        return token
 
 
 @dataclass
@@ -900,10 +905,7 @@ def ensure_labels(gh, repo):
 
 def cmd_init(args):
     config_path = CONFIG_DIR / "config.json"
-    print("Token: a classic PAT with `repo` scope. Leave blank to use `gh auth token`.")
-    token = getpass.getpass("Token: ").strip()
-    token_command = "" if token else "gh auth token"
-    cfg = Config(username="", pool_repo="", monthly_credits=0, token=token, token_command=token_command)
+    cfg = Config(username="", pool_repo="", monthly_credits=0)
     gh = GitHub(cfg.resolve_token())
     login = gh.request("GET", "/user")["login"]
     print(f"Authenticated as {login}")
@@ -927,8 +929,6 @@ def cmd_init(args):
         username=login,
         pool_repo=pool_repo,
         monthly_credits=monthly,
-        token=token,
-        token_command=token_command,
         credits_per_review=int(per_review),
         max_requests_per_requester_per_day=int(limit),
     )

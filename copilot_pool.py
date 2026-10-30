@@ -40,6 +40,10 @@ HEARTBEAT_LABEL = "pool-heartbeat"
 # Status issues from before the board moved to README.md; retired on startup.
 LEGACY_STATUS_LABEL = "pool-status"
 BOARD_PATH = "README.md"
+# Pool-wide settings shared by every member, editable by any of them.
+SETTINGS_PATH = "pool.json"
+DEFAULT_CREDITS_PER_REVIEW = 100
+MAX_CREDITS_PER_REVIEW = 10**6
 STATUS_SOURCES = {"copilot", "local-count"}
 STATUS_FIELDS = ("remaining", "quota", "used", "source")
 REVIEW_ROLES = {"triage", "write", "maintain", "admin"}
@@ -154,8 +158,6 @@ class Config:
     monthly_credits: int
     token: str = ""
     token_command: str = "gh auth token"
-    # Minimum credits a member needs to take on a review, and the local-count cost of one.
-    credits_per_review: int = 100
     poll_interval: int = 60
     heartbeat_interval: int = 300
     stale_after: int = 900
@@ -428,6 +430,7 @@ class Pool:
         self.cfg = config
         self.gh = gh
         self._warned_fallback = False
+        self._credits_per_review = None
         self.state = state
         self.state_path = state_path
         self.clock = clock
@@ -498,6 +501,25 @@ class Pool:
                 return issues
             cursor = conn["pageInfo"]["endCursor"]
 
+    @property
+    def credits_per_review(self):
+        """Pool-wide minimum credits for a review, read from the pool repo once per cycle."""
+        if self._credits_per_review is None:
+            value = None
+            try:
+                resp = self.gh.request("GET", f"/repos/{self.cfg.pool_repo}/contents/{SETTINGS_PATH}")
+                value = json.loads(base64.b64decode(resp["content"])).get("credits_per_review")
+            except GitHubError as e:
+                if e.status != 404:
+                    log.warning("Couldn't read %s (%s); using %s credits per review", SETTINGS_PATH, e, DEFAULT_CREDITS_PER_REVIEW)
+            except (KeyError, TypeError, ValueError, AttributeError) as e:
+                log.warning("Malformed %s (%s); using %s credits per review", SETTINGS_PATH, e, DEFAULT_CREDITS_PER_REVIEW)
+            if value is not None and not (is_int(value) and 1 <= value <= MAX_CREDITS_PER_REVIEW):
+                log.warning("Ignoring credits_per_review=%r in %s; using %s", value, SETTINGS_PATH, DEFAULT_CREDITS_PER_REVIEW)
+                value = None
+            self._credits_per_review = DEFAULT_CREDITS_PER_REVIEW if value is None else value
+        return self._credits_per_review
+
     def usage(self):
         """Return (credits used this month, monthly credits, source)."""
         try:
@@ -515,7 +537,7 @@ class Pool:
                 self._warned_fallback = True
         now = self.clock()
         count = self.state.requested_count if self.state.month == now.strftime("%Y-%m") else 0
-        return count * self.cfg.credits_per_review, self.cfg.monthly_credits, "local-count"
+        return count * self.credits_per_review, self.cfg.monthly_credits, "local-count"
 
     def remaining(self):
         used, quota, _ = self.usage()
@@ -703,7 +725,7 @@ class Pool:
                 "not_planned",
             )
             return
-        if self.lendable() < self.cfg.credits_per_review:
+        if self.lendable() < self.credits_per_review:
             self._close(
                 number,
                 f"@{requester} sorry, @{self.me} doesn't have enough Copilot credits left for a review. Run `request` again to pick someone else.",
@@ -812,7 +834,7 @@ class Pool:
 
     def request_review(self, pr, via_pool=False):
         """Requester side. Returns a human-readable outcome."""
-        if not via_pool and self.remaining() >= self.cfg.credits_per_review:
+        if not via_pool and self.remaining() >= self.credits_per_review:
             listed = request_copilot(self.gh, pr)
             self.record_usage()
             suffix = "" if listed else " (GitHub didn't list Copilot as a reviewer; check your Copilot plan)"
@@ -820,7 +842,7 @@ class Pool:
 
         members = self.members()
         peer = pick_peer(
-            self.read_statuses(members), self.me, self.clock(), self.cfg.stale_after, self.cfg.credits_per_review
+            self.read_statuses(members), self.me, self.clock(), self.cfg.stale_after, self.credits_per_review
         )
         if peer is None:
             raise SystemExit("No online pool member has enough credits left for a review.")
@@ -876,6 +898,8 @@ class Pool:
 
     def run_once(self):
         self.reload_state()
+        # Pick up pool.json edits by other members.
+        self._credits_per_review = None
         members = self.members()
         open_requests = self.pool_issues(REQUEST_LABEL)
         steps = (
@@ -892,6 +916,29 @@ class Pool:
             except Exception:
                 # Steps are independent; a failure in one must not starve the rest.
                 log.exception("%s failed", step.__name__)
+
+
+def ensure_pool_settings(gh, repo):
+    """Create pool.json with defaults if the pool doesn't have one yet."""
+    path = f"/repos/{repo}/contents/{SETTINGS_PATH}"
+    try:
+        gh.request("GET", path)
+        return False
+    except GitHubError as e:
+        if e.status != 404:
+            raise
+    content = json.dumps({"credits_per_review": DEFAULT_CREDITS_PER_REVIEW}, indent=2) + "\n"
+    try:
+        gh.request(
+            "PUT",
+            path,
+            {"message": "Add pool settings", "content": base64.b64encode(content.encode()).decode()},
+        )
+    except GitHubError as e:
+        if e.status not in (409, 422):  # another member created it first
+            raise
+        return False
+    return True
 
 
 def ensure_labels(gh, repo):
@@ -919,17 +966,17 @@ def cmd_init(args):
         monthly = int(input("Monthly Copilot credits: ").strip())
 
     pool_repo = input("Pool repo (owner/name): ").strip()
-    per_review = input("Credits one Copilot review costs (minimum a helper needs) [100]: ").strip() or "100"
     limit = input("Max requests you'll serve per member per day, 0 = unlimited [10]: ").strip() or "10"
 
     if not gh.request("GET", f"/repos/{pool_repo}").get("private"):
         raise SystemExit(f"Pool repo {pool_repo} must be private.")
     ensure_labels(gh, pool_repo)
+    if ensure_pool_settings(gh, pool_repo):
+        print(f"Created {SETTINGS_PATH} in {pool_repo} with credits_per_review={DEFAULT_CREDITS_PER_REVIEW}.")
     cfg = Config(
         username=login,
         pool_repo=pool_repo,
         monthly_credits=monthly,
-        credits_per_review=int(per_review),
         max_requests_per_requester_per_day=int(limit),
     )
     cfg.save(config_path)

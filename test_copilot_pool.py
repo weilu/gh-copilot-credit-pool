@@ -136,10 +136,18 @@ def quota_snapshot(used, entitlement, unlimited=False):
     }
 
 
-def make_pool(gh, tmp_path, me="alice", used=0, quota=300, copilot=True, **cfg):
-    """`used`/`quota` are what the Copilot endpoint reports; reviews cost 1 credit unless overridden."""
-    cfg.setdefault("credits_per_review", 1)
+SETTINGS = ("GET", f"/repos/{POOL}/contents/pool.json")
+
+
+def settings_resp(data):
+    text = data if isinstance(data, str) else json.dumps(data)
+    return {"content": base64.b64encode(text.encode()).decode(), "sha": "p1"}
+
+
+def make_pool(gh, tmp_path, me="alice", used=0, quota=300, copilot=True, credits_per_review=1, **cfg):
+    """`used`/`quota` are what the Copilot endpoint reports; pool.json sets the review cost (1 by default)."""
     config = cp.Config(username=me, pool_repo=POOL, monthly_credits=quota, token="t", **cfg)
+    gh.routes.setdefault(SETTINGS, settings_resp({"credits_per_review": credits_per_review}))
     gh.routes.setdefault(
         ("GET", cp.COPILOT_USER_ENDPOINT),
         quota_snapshot(used, quota) if copilot else cp.GitHubError(404, "Not Found"),
@@ -385,12 +393,70 @@ def test_helper_declines_when_below_one_review(tmp_path):
     assert closes(gh)[0]["state_reason"] == "not_planned"
 
 
+def test_credits_per_review_comes_from_pool_settings(tmp_path):
+    gh = FakeGitHub({SETTINGS: settings_resp({"credits_per_review": 37})})
+    assert make_pool(gh, tmp_path).credits_per_review == 37
+
+
+@pytest.mark.parametrize(
+    "resp",
+    [
+        cp.GitHubError(404, "Not Found"),
+        cp.GitHubError(500, "boom"),
+        settings_resp("not json"),
+        settings_resp([1, 2]),
+        settings_resp({}),
+        settings_resp({"credits_per_review": 0}),
+        settings_resp({"credits_per_review": -5}),
+        settings_resp({"credits_per_review": "50"}),
+        settings_resp({"credits_per_review": True}),
+        settings_resp({"credits_per_review": 10**7}),
+        {"sha": "x"},
+    ],
+)
+def test_credits_per_review_falls_back_to_default(tmp_path, resp):
+    gh = FakeGitHub({SETTINGS: resp})
+    assert make_pool(gh, tmp_path).credits_per_review == cp.DEFAULT_CREDITS_PER_REVIEW
+
+
+def test_credits_per_review_is_cached_within_a_cycle_and_refreshed_each_cycle(tmp_path):
+    gh = FakeGitHub({**pool_routes(), SETTINGS: settings_resp({"credits_per_review": 40}), ("GET", "/user/repository_invitations"): []})
+    pool = make_pool(gh, tmp_path)
+    assert pool.credits_per_review == 40
+    gh.routes[SETTINGS] = settings_resp({"credits_per_review": 60})
+    assert pool.credits_per_review == 40
+    assert len(gh.called(*SETTINGS)) == 1
+    pool.run_once()
+    assert pool.credits_per_review == 60
+
+
+def test_ensure_pool_settings_creates_default_only_when_missing():
+    gh = FakeGitHub({SETTINGS: cp.GitHubError(404, "Not Found")})
+    assert cp.ensure_pool_settings(gh, POOL) is True
+    (_, _, body, _), = gh.called("PUT", f"/repos/{POOL}/contents/pool.json")
+    assert json.loads(base64.b64decode(body["content"])) == {"credits_per_review": cp.DEFAULT_CREDITS_PER_REVIEW}
+
+    gh = FakeGitHub({SETTINGS: settings_resp({"credits_per_review": 5})})
+    assert cp.ensure_pool_settings(gh, POOL) is False
+    assert not gh.called("PUT", f"/repos/{POOL}/contents/pool.json")
+
+
+def test_ensure_pool_settings_tolerates_concurrent_create():
+    gh = FakeGitHub(
+        {SETTINGS: cp.GitHubError(404, "Not Found"), ("PUT", f"/repos/{POOL}/contents/pool.json"): cp.GitHubError(422, "sha")}
+    )
+    assert cp.ensure_pool_settings(gh, POOL) is False
+
+
 def test_config_migrates_monthly_quota_and_drops_unknown_keys(tmp_path):
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"username": "a", "pool_repo": POOL, "monthly_quota": 300, "billing_token": "x"}))
+    path.write_text(
+        json.dumps({"username": "a", "pool_repo": POOL, "monthly_quota": 300, "billing_token": "x", "credits_per_review": 5})
+    )
     cfg = cp.Config.load(path)
     assert cfg.monthly_credits == 300
     assert not hasattr(cfg, "billing_token")
+    assert not hasattr(cfg, "credits_per_review")
 
 
 # --- statuses ------------------------------------------------------------------

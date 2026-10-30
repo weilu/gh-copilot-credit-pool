@@ -282,6 +282,30 @@ def test_remaining_falls_back_to_local_count_in_credits(tmp_path, response):
     assert pool.remaining() == 2900
 
 
+def test_local_estimate_is_never_lent(tmp_path):
+    gh = helper_gh()
+    pool = make_pool(gh, tmp_path, me="bob", copilot=False, quota=11900, credits_per_review=100)
+    assert pool.remaining() == 11900
+    assert pool.lendable() == 0
+    pool.handle_request(as_issue(request_node()), MEMBERS)
+    assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
+    assert closes(gh)[0]["state_reason"] == "not_planned"
+
+
+def test_local_estimate_publishes_zero_lendable_credits(tmp_path):
+    gh = FakeGitHub(pool_routes())
+    make_pool(gh, tmp_path, copilot=False, quota=11900).publish_status({"alice"})
+    (_, _, body, _), = gh.called("POST", f"/repos/{POOL}/issues")
+    status = cp.extract_json_block(body["body"])
+    assert (status["remaining"], status["source"]) == (0, "local-count")
+
+
+def test_own_request_may_use_local_estimate(tmp_path):
+    gh = FakeGitHub({("POST", "/repos/octo/repo/pulls/3/requested_reviewers"): {"requested_reviewers": []}})
+    pool = make_pool(gh, tmp_path, copilot=False, quota=11900)
+    assert "your own credits" in pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+
+
 def test_local_count_resets_each_month(tmp_path):
     pool = make_pool(FakeGitHub(), tmp_path, copilot=False)
     seed_state(pool, month="2026-09", requested_count=300)

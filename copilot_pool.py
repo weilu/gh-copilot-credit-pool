@@ -462,6 +462,12 @@ class Pool:
         used, quota, _ = self.usage()
         return max(0, quota - used)
 
+    def lendable(self):
+        """Credits this member can spend on others' reviews; 0 unless Copilot itself reported them."""
+        used, quota, source = self.usage()
+        # The local estimate misses chat/agent usage, so it can claim credits that are already gone.
+        return max(0, quota - used) if source == "copilot" else 0
+
     def record_usage(self):
         with self.mutate_state() as state:
             state.roll_month(self.clock())
@@ -480,7 +486,7 @@ class Pool:
 
     def publish_status(self, members):
         used, quota, source = self.usage()
-        remaining = max(0, quota - used)
+        remaining = max(0, quota - used) if source == "copilot" else 0
         now = self.clock()
         if (
             self._last_published
@@ -570,7 +576,7 @@ class Pool:
                 "not_planned",
             )
             return
-        if self.remaining() < self.cfg.credits_per_review:
+        if self.lendable() < self.cfg.credits_per_review:
             self._close(
                 number,
                 f"@{requester} sorry, @{self.me} doesn't have enough Copilot credits left for a review. Run `request` again to pick someone else.",

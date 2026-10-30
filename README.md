@@ -26,7 +26,9 @@ Python 3.9+, standard library only. macOS/Linux (it uses `fcntl` file locks).
   the Copilot clients use. It works for personal plans and for seats paid by an organization, which
   GitHub's billing API doesn't cover. It is undocumented and could change. If it fails, the script
   estimates usage as (reviews it has requested this month) × `credits_per_review`, against the
-  monthly credits you enter. Spending beyond your allowance is never counted as available.
+  monthly credits you enter. That estimate misses chat and agent usage, so it is only used
+  for your own `request`: while it's in use you advertise 0 credits and decline others' requests.
+  Spending beyond your allowance is never counted as available.
 - **Credits per review**: the least a member must have left to take a review, and the cost used for
   that estimate (default 100). Lower it once you know what a review actually costs.
 - **Pool repo**.

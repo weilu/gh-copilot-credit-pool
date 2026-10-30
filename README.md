@@ -121,11 +121,14 @@ that.
   within range, nothing dated in the future. Each member's script rewrites its own row if it doesn't
   match.
 - **`pool.json`** is shared on purpose. Values are validated, but any member can change
-  `credits_per_review` for everyone.
+  `credits_per_review` for everyone. Raising it only makes helpers more selective. Lowering it lets
+  helpers with very few credits left accept reviews. If a review then costs more than they have
+  left, it fails, or, on a seat that allows spending beyond the allowance, it is billed as overage
+  to that member or their organization.
 
-At worst, tampering sends a request to the wrong member or keeps someone from being picked. The
-helper's own script still checks its real credits, the rate limit and the requester's access before
-spending anything.
+Apart from `pool.json`, tampering can at worst send a request to the wrong member or keep someone
+from being picked. The helper's own script still checks its real credits, the rate limit and the
+requester's access before spending anything.
 
 On first `run`, the script closes the member's old `pool-status` issue from earlier versions.
 

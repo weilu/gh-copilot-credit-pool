@@ -93,8 +93,8 @@ def put_board(gh, index=-1):
     return body, cp.extract_json_block(base64.b64decode(body["content"]).decode())
 
 
-def request_node(pr=PR, requester="alice", helper="bob", number=7, created_at=NOW, editor=None):
-    body = cp.json_block({"pr": pr, "requester": requester})
+def request_node(pr=PR, requester="alice", helper="bob", number=7, created_at=NOW, editor=None, own_credits=None):
+    body = cp.json_block({"pr": pr, "requester": requester, "own_credits": own_credits})
     return node(number, requester, body, editor=editor, assignees=[helper], created_at=created_at)
 
 
@@ -413,34 +413,66 @@ def test_request_review_refreshes_own_row_before_borrowing(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "requester_row, serves",
-    [
-        (entry("alice", 0, quota=11900, used=11800), False),  # 100 of her own: at the pool minimum
-        (entry("alice", 0, quota=11900, used=11801), True),  # 99: below it
-        (entry("alice", 0, quota=11900, used=0, source="local-count"), True),  # estimate: unknown
-        (None, True),  # no row: unknown
-        ({**entry("alice", 0, quota=11900, used=0), "updated_at": "garbage"}, True),  # invalid row: unknown
-    ],
-    ids=["has-enough", "just-below", "local-estimate", "no-row", "invalid-row"],
+    "own_credits, serves",
+    [(100, False), (99, True), (None, True), (-5, True), ("lots", True)],
+    ids=["has-enough", "just-below", "not-reported", "negative", "not-a-number"],
 )
-def test_helper_declines_requester_with_enough_own_credits(tmp_path, requester_row, serves):
+def test_helper_declines_requester_with_enough_own_credits(tmp_path, own_credits, serves):
     gh = helper_gh()
-    with_board(gh, *([requester_row] if requester_row else []))
     pool = make_pool(gh, tmp_path, me="bob", credits_per_review=100, quota=11900)
-    pool.handle_request(as_issue(request_node()), MEMBERS)
+    pool.handle_request(as_issue(request_node(own_credits=own_credits)), MEMBERS)
     assert bool(gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")) is serves
     if not serves:
         (_, _, comment, _), = gh.called("POST", f"/repos/{POOL}/issues/7/comments")
         assert "100 Copilot credits of your own" in comment["body"]
 
 
-def test_helper_check_ignores_requesters_lending_floor(tmp_path):
-    # alice advertises 0 (below her own min_credits_to_lend) but still has 300 to spend herself.
+def test_forged_board_row_cannot_block_a_request(tmp_path):
+    # Another member edits the README to claim alice is rich; only her own request issue counts.
     gh = helper_gh()
-    with_board(gh, entry("alice", 0, quota=11900, used=11600))
+    with_board(gh, entry("alice", 11900, quota=11900, used=0))
     pool = make_pool(gh, tmp_path, me="bob", credits_per_review=100, quota=11900)
-    pool.handle_request(as_issue(request_node()), MEMBERS)
-    assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
+    pool.handle_request(as_issue(request_node(own_credits=10)), MEMBERS)
+    assert gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
+    assert not gh.called(*BOARD)
+
+
+def test_tampered_own_credits_in_request_is_not_trusted(tmp_path):
+    gh = helper_gh()
+    pool = make_pool(gh, tmp_path, me="bob", credits_per_review=100, quota=11900)
+    pool.handle_request(as_issue(request_node(own_credits=5000, editor="carol")), MEMBERS)
+    (_, _, comment, _), = gh.called("POST", f"/repos/{POOL}/issues/7/comments")
+    assert "edited by @carol" in comment["body"]
+
+
+def borrow_and_read_payload(gh, pool):
+    pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+    (body,) = [c[2] for c in gh.called("POST", f"/repos/{POOL}/issues") if cp.REQUEST_LABEL in c[2]["labels"]]
+    return cp.extract_json_block(body["body"])
+
+
+def lender_routes():
+    routes = pool_routes(members=("alice", "carol"))
+    routes.update(
+        {
+            ("GET", "/repos/octo/repo/collaborators/carol/permission"): {"role_name": "write"},
+            ("POST", f"/repos/{POOL}/issues"): {"number": 9, "html_url": "u"},
+        }
+    )
+    return with_board(FakeGitHub(routes), entry("carol", 5000, quota=11900))
+
+
+def test_request_issue_reports_copilot_credits(tmp_path):
+    gh = lender_routes()
+    pool = make_pool(gh, tmp_path, used=11850, quota=11900, credits_per_review=100)
+    assert borrow_and_read_payload(gh, pool)["own_credits"] == 50
+
+
+def test_request_issue_reports_unknown_credits_on_local_estimate(tmp_path):
+    gh = lender_routes()
+    pool = make_pool(gh, tmp_path, quota=11900, copilot=False, credits_per_review=1000)
+    seed_state(pool, month="2026-10", requested_count=11)  # estimate: 11000 used, 900 left < 1000
+    assert borrow_and_read_payload(gh, pool)["own_credits"] is None
 
 
 def test_request_has_no_via_pool_flag():

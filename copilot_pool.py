@@ -358,6 +358,13 @@ def render_board(board):
     return "\n".join(lines)
 
 
+def request_own_credits(issue):
+    """Credits the requester reported having of their own when filing; None if not reported."""
+    payload = extract_json_block(issue["body"])
+    value = payload.get("own_credits") if isinstance(payload, dict) else None
+    return value if is_int(value) and value >= 0 else None
+
+
 def request_pr(issue):
     """Return the PullRef a request issue asks for, or None if the body is malformed."""
     payload = extract_json_block(issue["body"])
@@ -603,14 +610,11 @@ class Pool:
                     seen[author] = stamp
         return seen
 
-    def own_credits_of(self, member):
-        """Credits `member` has of their own per Copilot, from their board row; None if unknown."""
-        entry = valid_status(self.read_board()[0].get(member), member, self.clock())
-        # A local estimate overstates credits, and "remaining" is 0 below a member's lending floor,
-        # so only Copilot-reported quota minus usage says what they can spend themselves.
-        if entry is None or entry["source"] != "copilot":
-            return None
-        return max(0, entry["quota"] - entry["used"])
+    def own_credits(self):
+        """Credits we can spend on our own reviews per Copilot; None when only the local estimate is available."""
+        used, quota, source = self.usage()
+        # Not `lendable()`: our own lending floor doesn't stop us paying for our own reviews.
+        return max(0, quota - used) if source == "copilot" else None
 
     def read_statuses(self, members):
         now = self.clock()
@@ -752,7 +756,9 @@ class Pool:
             self._close(number, "Already handled.")
             return
 
-        own = self.own_credits_of(requester)
+        # Read from the request itself, which only the requester can have last edited (checked above);
+        # the README board is writable by every member and would let one block another's requests.
+        own = request_own_credits(issue)
         if own is not None and own >= self.credits_per_review:
             self._close(
                 number,
@@ -910,7 +916,7 @@ class Pool:
                 state.invites.append(invite)
         invited = invite is not None
 
-        payload = {"pr": pr.url, "requester": self.me}
+        payload = {"pr": pr.url, "requester": self.me, "own_credits": self.own_credits()}
         body = (
             f"@{peer}, please request a Copilot review on {pr.url}.\n\n"
             f"{'I invited you as a collaborator; your daemon will accept it.' if invited else ''}\n\n"

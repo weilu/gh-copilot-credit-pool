@@ -97,11 +97,14 @@ as available.
     open state, so a tampered heartbeat gets repaired;
   - accepts a repo invitation only when the inviter is a pool member with an open request for a PR
     in that repo;
-  - handles open `copilot-request` issues assigned to it. It declines if the requester's README row
-    shows they still have at least `credits_per_review` credits of their own (monthly minus used, as
-    reported by Copilot). That covers people who bypass `request`, and those below their own lending
-    floor, who show 0 to lend but can still pay for their own reviews. If the requester has no row,
-    or only a local estimate, the helper can't tell and goes ahead. Otherwise it requests
+  - handles open `copilot-request` issues assigned to it. It declines if the request says the
+    requester still has at least `credits_per_review` credits of their own. The requester's script
+    records that figure, as reported by Copilot, in the request issue it opens. It's taken from the
+    request rather than the README because the README can't be attributed and another member could
+    forge a row to block someone. The requester could understate their own figure, but they could
+    equally edit their copy of the script, so this rule relies on trust. If no figure was recorded,
+    for example because the requester only has a local estimate, the helper goes ahead. Otherwise it
+    requests
     `copilot-pull-request-reviewer[bot]` on the PR, comments, and closes the issue. It acts only when
     the requester wrote the PR or can request reviewers on it, because the helper's token may reach
     repos the requester can't. Any failure is retried until `access_timeout`, then the issue is

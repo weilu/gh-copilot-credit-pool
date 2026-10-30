@@ -5,7 +5,7 @@ When you're out of premium requests, the script asks the pool member with the mo
 left to request Copilot on your PR (inviting them as a collaborator if needed). Their daemon
 accepts the invite and makes the request, so the review is billed to them.
 
-Python 3.9+, standard library only.
+Python 3.9+, standard library only. macOS/Linux (it uses `fcntl` file locks).
 
 ## Setup (once per pool)
 
@@ -55,6 +55,9 @@ Config lives in `~/.config/copilot-pool/config.json` (mode 600). Override the di
     find out about PRs the helper can see and the requester can't;
   - removes collaborator access it granted for its own requests once they're done. A completed
     request first waits for Copilot's review, or `review_grace` (1h), whichever comes first.
+    Access is always removed within `access_timeout + review_grace` (2h) of the invite, whatever
+    state the request is in. The invite is recorded before it's sent, and withdrawn if opening the
+    request issue fails.
 - `request` picks the member with the most remaining credits whose status is newer than
   `stale_after` (15 min). If that member can't request reviewers on the repo, it invites them, with
   the `triage` role on org repos and as a regular collaborator on personal repos. Then it opens a

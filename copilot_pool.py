@@ -13,7 +13,9 @@ Commands:
 """
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import getpass
 import json
 import logging
@@ -25,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -35,6 +38,8 @@ STATUS_LABEL = "pool-status"
 REVIEW_ROLES = {"triage", "write", "maintain", "admin"}
 CLOCK_SKEW = dt.timedelta(minutes=5)
 DAY = dt.timedelta(days=1)
+# How long an invite may exist before its request issue is opened.
+PENDING_INVITE_GRACE = dt.timedelta(minutes=5)
 CONFIG_DIR = Path(os.environ.get("COPILOT_POOL_HOME", "~/.config/copilot-pool")).expanduser()
 
 # Hides why a request can't be served so requesters can't probe the helper's private PRs.
@@ -190,8 +195,23 @@ class State:
             return cls()
 
     def save(self, path):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(asdict(self), indent=2) + "\n")
+        os.replace(tmp, path)
+
+    @classmethod
+    @contextlib.contextmanager
+    def locked(cls, path):
+        """Read-modify-write under an exclusive lock; `request` and `run` share this file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path.with_name(path.name + ".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = cls.load(path)
+            yield state
+            state.save(path)
 
     def roll_month(self, now):
         month = now.strftime("%Y-%m")
@@ -345,8 +365,15 @@ class Pool:
     def me(self):
         return self.cfg.username
 
-    def save_state(self):
-        self.state.save(self.state_path)
+    @contextlib.contextmanager
+    def mutate_state(self):
+        # Reload under the lock so a concurrent `request` or `run` never loses another's write.
+        with State.locked(self.state_path) as state:
+            yield state
+        self.state = state
+
+    def reload_state(self):
+        self.state = State.load(self.state_path)
 
     def pool_repo_info(self):
         if self._pool_repo_info is None:
@@ -398,7 +425,6 @@ class Pool:
     def usage(self):
         """Return (premium requests used this month, source)."""
         now = self.clock()
-        self.state.roll_month(now)
         if self.billing_gh is not None:
             try:
                 data = self.billing_gh.request(
@@ -415,16 +441,17 @@ class Pool:
             except GitHubError as e:
                 log.warning("Billing usage API unavailable (%s); using local count", e)
                 self.billing_gh = None
-        return self.state.requested_count, "local-count"
+        same_month = self.state.month == now.strftime("%Y-%m")
+        return (self.state.requested_count if same_month else 0), "local-count"
 
     def remaining(self):
         used, _ = self.usage()
         return int(max(0, self.cfg.monthly_quota - used))
 
     def record_usage(self):
-        self.state.roll_month(self.clock())
-        self.state.requested_count += 1
-        self.save_state()
+        with self.mutate_state() as state:
+            state.roll_month(self.clock())
+            state.requested_count += 1
 
     def read_statuses(self, members):
         now = self.clock()
@@ -492,9 +519,7 @@ class Pool:
 
     def _served_recently(self, requester):
         cutoff = self.clock() - DAY
-        recent = [t for t in self.state.served.get(requester, []) if parse_time(t) > cutoff]
-        self.state.served[requester] = recent
-        return len(recent)
+        return [t for t in self.state.served.get(requester, []) if parse_time(t) > cutoff]
 
     def serve_requests(self, members, open_requests):
         for issue in open_requests:
@@ -524,7 +549,7 @@ class Pool:
             return
 
         limit = self.cfg.max_requests_per_requester_per_day
-        if limit and self._served_recently(requester) >= limit:
+        if limit and len(self._served_recently(requester)) >= limit:
             self._close(
                 number,
                 f"@{requester} @{self.me} serves at most {limit} requests per person per day. Try again later.",
@@ -554,9 +579,14 @@ class Pool:
                 self._close(number, f"@{requester} {CANNOT_SERVE}", "not_planned")
             return
 
-        self.state.handled_issues = (self.state.handled_issues + [number])[-500:]
-        self.state.served.setdefault(requester, []).append(self.clock().isoformat(timespec="seconds"))
-        self.record_usage()
+        now = self.clock()
+        with self.mutate_state() as state:
+            state.handled_issues = (state.handled_issues + [number])[-500:]
+            cutoff = now - DAY
+            recent = [t for t in state.served.get(requester, []) if parse_time(t) > cutoff]
+            state.served[requester] = recent + [now.isoformat(timespec="seconds")]
+            state.roll_month(now)
+            state.requested_count += 1
         note = (
             ""
             if listed
@@ -567,15 +597,23 @@ class Pool:
         log.info("Requested Copilot review on %s for %s", pr.url, requester)
 
     def _invite_still_needed(self, inv, open_requests):
+        age = self.clock() - parse_time(inv["created_at"])
+        # Hard cap so no request state, open issue or tampering can keep access alive indefinitely.
+        if age >= dt.timedelta(seconds=self.cfg.access_timeout + self.cfg.review_grace):
+            return False
         for issue in open_requests:
             pr = request_pr(issue)
             if (
                 issue["author"] == self.me
+                and edited_by_author(issue)
                 and inv["helper"] in issue["assignees"]
                 and pr
                 and pr.full_name.lower() == inv["repo"].lower()
             ):
                 return True
+        if inv["issue"] is None:
+            # `request` is between sending the invite and opening the issue, or crashed in between.
+            return age < PENDING_INVITE_GRACE
         try:
             issue = self.gh.request("GET", f"/repos/{self.cfg.pool_repo}/issues/{inv['issue']}")
         except GitHubError as e:
@@ -604,16 +642,19 @@ class Pool:
                 raise
         log.info("Revoked @%s's access to %s", inv["helper"], inv["repo"])
 
+    def forget_invite(self, invite_id):
+        with self.mutate_state() as state:
+            state.invites = [i for i in state.invites if i["id"] != invite_id]
+
     def cleanup_invites(self, open_requests):
         for inv in list(self.state.invites):
             try:
                 if self._invite_still_needed(inv, open_requests):
                     continue
                 self.revoke_invite(inv)
-                self.state.invites.remove(inv)
-                self.save_state()
-            except GitHubError as e:
-                log.error("Couldn't revoke @%s's access to %s: %s", inv["helper"], inv["repo"], e)
+                self.forget_invite(inv["id"])
+            except (GitHubError, KeyError, ValueError) as e:
+                log.error("Couldn't revoke @%s's access to %s: %s", inv.get("helper"), inv.get("repo"), e)
 
     def request_review(self, pr, via_pool=False):
         """Requester side. Returns a human-readable outcome."""
@@ -628,9 +669,20 @@ class Pool:
         if peer is None:
             raise SystemExit("No online pool member has credits left.")
 
-        invited = not has_review_access(self.gh, pr, peer)
-        if invited:
-            invite_collaborator(self.gh, pr, peer)
+        invite = None
+        if not has_review_access(self.gh, pr, peer):
+            invite = {
+                "id": uuid.uuid4().hex,
+                "issue": None,
+                "repo": pr.full_name,
+                "pr": pr.number,
+                "helper": peer,
+                "created_at": self.clock().isoformat(timespec="seconds"),
+            }
+            # Record before granting, so a crash or failure below still leaves something to revoke.
+            with self.mutate_state() as state:
+                state.invites.append(invite)
+        invited = invite is not None
 
         payload = {"pr": pr.url, "requester": self.me}
         body = (
@@ -638,24 +690,36 @@ class Pool:
             f"{'I invited you as a collaborator; your daemon will accept it.' if invited else ''}\n\n"
             f"{json_block(payload)}"
         )
-        issue = self.gh.request(
-            "POST",
-            f"/repos/{self.cfg.pool_repo}/issues",
-            {
-                "title": f"Copilot review: {pr.owner}/{pr.repo}#{pr.number}",
-                "body": body,
-                "labels": [REQUEST_LABEL],
-                "assignees": [peer],
-            },
-        )
-        if invited:
-            self.state.invites.append(
-                {"issue": issue["number"], "repo": pr.full_name, "pr": pr.number, "helper": peer}
+        try:
+            if invite:
+                invite_collaborator(self.gh, pr, peer)
+            issue = self.gh.request(
+                "POST",
+                f"/repos/{self.cfg.pool_repo}/issues",
+                {
+                    "title": f"Copilot review: {pr.owner}/{pr.repo}#{pr.number}",
+                    "body": body,
+                    "labels": [REQUEST_LABEL],
+                    "assignees": [peer],
+                },
             )
-            self.save_state()
+        except Exception:
+            if invite:
+                try:
+                    self.revoke_invite(invite)
+                    self.forget_invite(invite["id"])
+                except GitHubError as e:
+                    log.error("Couldn't roll back invite for @%s; `run` will retry: %s", peer, e)
+            raise
+        if invite:
+            with self.mutate_state() as state:
+                for record in state.invites:
+                    if record["id"] == invite["id"]:
+                        record["issue"] = issue["number"]
         return f"Asked @{peer} to request Copilot on {pr.url}{' (invited as collaborator)' if invited else ''}: {issue['html_url']}"
 
     def run_once(self):
+        self.reload_state()
         members = self.members()
         open_requests = self.pool_issues(REQUEST_LABEL)
         steps = (

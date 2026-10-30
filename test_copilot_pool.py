@@ -103,6 +103,18 @@ def make_pool(gh, tmp_path, me="alice", used=0, quota=300, billing=True, **cfg):
     return cp.Pool(config, gh, billing_gh if billing else None, cp.State(), tmp_path / "state.json", clock=lambda: NOW)
 
 
+def seed_state(pool, **fields):
+    """Write state to disk the way another process would, then load it."""
+    with pool.mutate_state() as state:
+        for key, value in fields.items():
+            setattr(state, key, value)
+    pool.reload_state()
+
+
+def disk_state(pool):
+    return cp.State.load(pool.state_path)
+
+
 # --- parsing ---------------------------------------------------------------
 
 
@@ -364,7 +376,10 @@ def test_request_review_borrows_from_richest_peer_and_records_invite(tmp_path):
     (_, _, issue, _), = gh.called("POST", f"/repos/{POOL}/issues")
     assert issue["assignees"] == ["carol"]
     assert cp.extract_json_block(issue["body"])["pr"] == PR
-    assert pool.state.invites == [{"issue": 9, "repo": "octo/repo", "pr": 3, "helper": "carol"}]
+    (record,) = disk_state(pool).invites
+    assert {k: record[k] for k in ("issue", "repo", "pr", "helper", "created_at")} == {
+        "issue": 9, "repo": "octo/repo", "pr": 3, "helper": "carol", "created_at": NOW.isoformat(timespec="seconds")
+    }
 
 
 def test_request_review_skips_invite_when_peer_has_access(tmp_path):
@@ -490,10 +505,10 @@ def test_handle_request_declines_when_out_of_credits(tmp_path):
 def test_handle_request_enforces_per_requester_daily_limit(tmp_path):
     gh = helper_gh()
     pool = make_pool(gh, tmp_path, me="bob", max_requests_per_requester_per_day=2)
-    pool.state.served = {
+    seed_state(pool, served={
         "alice": [(NOW - dt.timedelta(hours=1)).isoformat(), (NOW - dt.timedelta(hours=2)).isoformat()],
         "carol": [],
-    }
+    })
     pool.handle_request(as_issue(request_node()), MEMBERS)
     assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
     (_, _, comment, _), = gh.called("POST", f"/repos/{POOL}/issues/7/comments")
@@ -503,7 +518,7 @@ def test_handle_request_enforces_per_requester_daily_limit(tmp_path):
 def test_handle_request_daily_limit_window_slides(tmp_path):
     gh = helper_gh()
     pool = make_pool(gh, tmp_path, me="bob", max_requests_per_requester_per_day=1)
-    pool.state.served = {"alice": [(NOW - dt.timedelta(hours=25)).isoformat()]}
+    seed_state(pool, served={"alice": [(NOW - dt.timedelta(hours=25)).isoformat()]})
     pool.handle_request(as_issue(request_node()), MEMBERS)
     assert gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
     assert len(pool.state.served["alice"]) == 1
@@ -512,7 +527,7 @@ def test_handle_request_daily_limit_window_slides(tmp_path):
 def test_handle_request_zero_limit_means_unlimited(tmp_path):
     gh = helper_gh()
     pool = make_pool(gh, tmp_path, me="bob", max_requests_per_requester_per_day=0)
-    pool.state.served = {"alice": [NOW.isoformat()] * 50}
+    seed_state(pool, served={"alice": [NOW.isoformat()] * 50})
     pool.handle_request(as_issue(request_node()), MEMBERS)
     assert gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
 
@@ -542,7 +557,7 @@ def test_handle_request_closes_malformed(tmp_path, body):
 def test_handle_request_does_not_double_spend(tmp_path):
     gh = helper_gh()
     pool = make_pool(gh, tmp_path, me="bob")
-    pool.state.handled_issues = [7]
+    seed_state(pool, handled_issues=[7])
     pool.handle_request(as_issue(request_node()), MEMBERS)
     assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
     assert closes(gh)
@@ -560,7 +575,7 @@ def test_serve_requests_continues_past_a_failing_request(tmp_path):
 
 # --- collaborator cleanup ------------------------------------------------------
 
-INVITE = {"issue": 9, "repo": "octo/repo", "pr": 3, "helper": "carol"}
+INVITE = {"id": "inv1", "issue": 9, "repo": "octo/repo", "pr": 3, "helper": "carol", "created_at": NOW.isoformat()}
 
 
 def cleanup_gh(issue, reviews=(), pending=()):
@@ -579,25 +594,25 @@ def closed_issue(reason="completed", closed_at=NOW):
     return {"state": "closed", "state_reason": reason, "closed_at": closed_at.isoformat()}
 
 
-def run_cleanup(gh, tmp_path, open_requests=()):
+def run_cleanup(gh, tmp_path, open_requests=(), invite=INVITE):
     pool = make_pool(gh, tmp_path)
-    pool.state.invites = [dict(INVITE)]
+    seed_state(pool, invites=[dict(invite)])
     pool.cleanup_invites(list(open_requests))
-    return pool
+    return disk_state(pool)
 
 
 def test_cleanup_waits_for_copilot_review(tmp_path):
     gh = cleanup_gh(closed_issue())
-    pool = run_cleanup(gh, tmp_path)
+    state = run_cleanup(gh, tmp_path)
     assert not gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
-    assert pool.state.invites == [INVITE]
+    assert state.invites == [INVITE]
 
 
 def test_cleanup_revokes_after_copilot_review(tmp_path):
     gh = cleanup_gh(closed_issue(), reviews=[{"user": {"login": "copilot-pull-request-reviewer[bot]"}}])
-    pool = run_cleanup(gh, tmp_path)
+    state = run_cleanup(gh, tmp_path)
     assert gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
-    assert pool.state.invites == []
+    assert state.invites == []
 
 
 def test_cleanup_revokes_after_grace_period(tmp_path):
@@ -610,10 +625,10 @@ def test_cleanup_revokes_declined_request_and_pending_invitation(tmp_path):
     pending = [{"id": 55, "invitee": {"login": "carol"}}, {"id": 56, "invitee": {"login": "dave"}}]
     gh = cleanup_gh(closed_issue(reason="not_planned"), pending=pending)
     gh.routes[("DELETE", "/repos/octo/repo/collaborators/carol")] = cp.GitHubError(404, "Not Found")
-    pool = run_cleanup(gh, tmp_path)
+    state = run_cleanup(gh, tmp_path)
     assert gh.called("DELETE", "/repos/octo/repo/invitations/55")
     assert not gh.called("DELETE", "/repos/octo/repo/invitations/56")
-    assert pool.state.invites == []
+    assert state.invites == []
 
 
 def test_cleanup_keeps_access_while_issue_open(tmp_path):
@@ -632,8 +647,113 @@ def test_cleanup_keeps_access_while_another_request_needs_it(tmp_path):
 def test_cleanup_keeps_invite_when_revoke_fails(tmp_path):
     gh = cleanup_gh(closed_issue(reason="not_planned"))
     gh.routes[("DELETE", "/repos/octo/repo/collaborators/carol")] = cp.GitHubError(500, "boom")
-    pool = run_cleanup(gh, tmp_path)
-    assert pool.state.invites == [INVITE]
+    state = run_cleanup(gh, tmp_path)
+    assert state.invites == [INVITE]
+
+
+def test_cleanup_revokes_after_hard_deadline_even_if_request_still_open(tmp_path):
+    gh = cleanup_gh({"state": "open"})
+    old = {**INVITE, "created_at": (NOW - dt.timedelta(hours=3)).isoformat()}
+    still_open = as_issue(request_node(pr="octo/repo#3", helper="carol", number=9))
+    state = run_cleanup(gh, tmp_path, open_requests=[still_open], invite=old)
+    assert gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
+    assert state.invites == []
+
+
+def test_cleanup_ignores_tampered_open_request(tmp_path):
+    gh = cleanup_gh(closed_issue(reason="not_planned"))
+    tampered = as_issue(request_node(pr="octo/repo#4", helper="carol", number=10, editor="carol"))
+    run_cleanup(gh, tmp_path, open_requests=[tampered])
+    assert gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
+
+
+def test_cleanup_keeps_pending_invite_briefly_then_revokes(tmp_path):
+    pending = {**INVITE, "issue": None}
+    gh = cleanup_gh(None)
+    assert run_cleanup(gh, tmp_path, invite=pending).invites == [pending]
+    assert not gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
+
+    stale = {**pending, "created_at": (NOW - dt.timedelta(minutes=10)).isoformat()}
+    gh = cleanup_gh(None)
+    assert run_cleanup(gh, tmp_path / "2", invite=stale).invites == []
+    assert gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
+
+
+def borrow_routes(issue_resp):
+    routes = pool_routes(members=("alice", "carol"))
+    routes.update(
+        {
+            ("GET", "/repos/octo/repo/collaborators/carol/permission"): {"role_name": "read"},
+            ("GET", "/repos/octo/repo"): {"owner": {"type": "User"}},
+            ("POST", f"/repos/{POOL}/issues"): issue_resp,
+            ("GET", "/repos/octo/repo/invitations"): [{"id": 55, "invitee": {"login": "carol"}}],
+            ("DELETE", "/repos/octo/repo/invitations/55"): None,
+            ("DELETE", "/repos/octo/repo/collaborators/carol"): cp.GitHubError(404, "Not Found"),
+        }
+    )
+    return FakeGitHub(routes, issues={cp.STATUS_LABEL: [status_node("carol", 90)]})
+
+
+def test_request_review_records_invite_before_granting(tmp_path):
+    gh = borrow_routes({"number": 9, "html_url": "u"})
+    pool = make_pool(gh, tmp_path, used=300)
+    recorded_before_put = []
+    real = gh.request
+
+    def spy(method, path, body=None, params=None):
+        if method == "PUT":
+            recorded_before_put.append(len(disk_state(pool).invites))
+        return real(method, path, body, params)
+
+    gh.request = spy
+    pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+    assert recorded_before_put == [1]
+
+
+def test_request_review_rolls_back_invite_when_issue_creation_fails(tmp_path):
+    gh = borrow_routes(cp.GitHubError(500, "boom"))
+    pool = make_pool(gh, tmp_path, used=300)
+    with pytest.raises(cp.GitHubError):
+        pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+    assert gh.called("PUT", "/repos/octo/repo/collaborators/carol")
+    assert gh.called("DELETE", "/repos/octo/repo/invitations/55")
+    assert disk_state(pool).invites == []
+
+
+def test_request_review_keeps_record_when_rollback_fails(tmp_path):
+    gh = borrow_routes(cp.GitHubError(500, "boom"))
+    gh.routes[("GET", "/repos/octo/repo/invitations")] = cp.GitHubError(502, "bad gateway")
+    pool = make_pool(gh, tmp_path, used=300)
+    with pytest.raises(cp.GitHubError):
+        pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+    (record,) = disk_state(pool).invites
+    assert record["issue"] is None and record["helper"] == "carol"
+
+
+# --- concurrency between `request` and `run` -----------------------------------
+
+
+def test_daemon_write_does_not_lose_invite_recorded_by_request(tmp_path):
+    daemon = make_pool(FakeGitHub(), tmp_path, me="alice", billing=False)
+    daemon.reload_state()
+    gh = borrow_routes({"number": 9, "html_url": "u"})
+    requester = make_pool(gh, tmp_path, me="alice", used=300)
+    requester.request_review(cp.parse_pr_ref("octo/repo#3"))
+
+    # The daemon's in-memory state predates the invite; its next write must not drop it.
+    daemon.record_usage()
+    state = disk_state(daemon)
+    assert len(state.invites) == 1
+    assert state.requested_count == 1
+
+
+def test_run_once_reloads_state_written_by_other_process(tmp_path):
+    gh = FakeGitHub({**pool_routes(), ("GET", "/user/repository_invitations"): []})
+    pool = make_pool(gh, tmp_path)
+    other = make_pool(FakeGitHub(), tmp_path)
+    seed_state(other, handled_issues=[42])
+    pool.run_once()
+    assert pool.state.handled_issues == [42]
 
 
 # --- daemon loop ---------------------------------------------------------------

@@ -39,8 +39,9 @@ class FakeGitHub:
         return [c for c in self.calls if c[0] == method and c[1] == path]
 
 
-def node(number, author, body, editor=None, assignees=(), created_at=NOW, edited_at=None, title=None):
+def node(number, author, body, editor=None, assignees=(), created_at=NOW, edited_at=None, title=None, labels=()):
     return {
+        "labels": {"nodes": [{"name": n} for n in labels]},
         "number": number,
         "title": title if title is not None else f"issue {number}",
         "body": body,
@@ -79,8 +80,10 @@ def with_board(gh, *entries, online=None, text=None, sha="s1"):
     return gh
 
 
-def heartbeat_node(number, user, **kw):
-    return node(number, user, "alive", title=f"pool-heartbeat: {user}", **kw)
+def heartbeat_node(number, user, body=None, **kw):
+    kw.setdefault("labels", [cp.HEARTBEAT_LABEL])
+    body = cp.heartbeat_body(user, NOW) if body is None else body
+    return node(number, user, body, title=f"pool-heartbeat: {user}", **kw)
 
 
 def put_board(gh, index=-1):
@@ -104,6 +107,7 @@ def as_issue(n):
         "author": (n["author"] or {}).get("login"),
         "editor": (n["editor"] or {}).get("login"),
         "assignees": [a["login"] for a in n["assignees"]["nodes"]],
+        "labels": [lbl["name"] for lbl in n["labels"]["nodes"]],
     }
 
 
@@ -502,35 +506,69 @@ def test_publish_status_gives_up_after_repeated_conflicts(tmp_path):
     assert len(gh.called(*BOARD_PUT)) == 3
 
 
-def test_heartbeat_creates_then_edits_and_is_throttled(tmp_path):
-    gh = FakeGitHub(pool_routes())
+def heartbeat_gh():
+    return FakeGitHub({**pool_routes(), ("POST", f"/repos/{POOL}/issues"): {"number": 42}})
+
+
+def test_heartbeat_creates_records_and_edits_only_that_issue(tmp_path):
+    gh = heartbeat_gh()
     pool = make_pool(gh, tmp_path)
     pool.heartbeat()
     (_, _, created, _), = gh.called("POST", f"/repos/{POOL}/issues")
     assert created["labels"] == [cp.HEARTBEAT_LABEL]
     assert created["title"] == "pool-heartbeat: alice"
+    assert disk_state(pool).heartbeat_issue == 42
 
+    # A look-alike issue appearing later is never touched; only the recorded number is.
     gh.issues[cp.HEARTBEAT_LABEL] = [heartbeat_node(5, "alice")]
-    pool.heartbeat()
-    assert gh.called("PATCH", f"/repos/{POOL}/issues/5") == []
     pool._last_heartbeat = NOW - dt.timedelta(minutes=10)
     pool.heartbeat()
-    assert gh.called("PATCH", f"/repos/{POOL}/issues/5")
+    assert gh.called("PATCH", f"/repos/{POOL}/issues/42")
+    assert not gh.called("PATCH", f"/repos/{POOL}/issues/5")
     assert len(gh.called("POST", f"/repos/{POOL}/issues")) == 1
 
 
-def test_heartbeat_overwrites_own_tampered_issue(tmp_path):
-    gh = FakeGitHub(pool_routes())
+def test_heartbeat_is_throttled(tmp_path):
+    gh = heartbeat_gh()
+    pool = make_pool(gh, tmp_path)
+    pool.heartbeat()
+    pool.heartbeat()
+    assert len(gh.called("POST", f"/repos/{POOL}/issues")) == 1
+    assert gh.called("PATCH", f"/repos/{POOL}/issues/42") == []
+
+
+def test_heartbeat_recreates_when_recorded_issue_is_gone(tmp_path):
+    gh = heartbeat_gh()
+    gh.routes[("PATCH", f"/repos/{POOL}/issues/7")] = cp.GitHubError(404, "Not Found")
+    pool = make_pool(gh, tmp_path)
+    seed_state(pool, heartbeat_issue=7)
+    pool.heartbeat()
+    assert gh.called("POST", f"/repos/{POOL}/issues")
+    assert disk_state(pool).heartbeat_issue == 42
+
+
+def test_heartbeat_adopts_existing_issue_once(tmp_path):
+    gh = heartbeat_gh()
     gh.issues[cp.HEARTBEAT_LABEL] = [heartbeat_node(5, "alice", editor="bob")]
-    make_pool(gh, tmp_path).heartbeat()
+    pool = make_pool(gh, tmp_path)
+    pool.heartbeat()
     assert gh.called("PATCH", f"/repos/{POOL}/issues/5")
     assert not gh.called("POST", f"/repos/{POOL}/issues")
+    assert disk_state(pool).heartbeat_issue == 5
 
 
-def test_heartbeat_ignores_relabelled_issues(tmp_path):
-    gh = FakeGitHub(pool_routes())
-    # Someone put the heartbeat label on one of alice's other issues.
-    gh.issues[cp.HEARTBEAT_LABEL] = [node(9, "alice", "a request", title="Copilot review: octo/repo#3", edited_at=NOW)]
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        node(9, "alice", "a request", title="pool-heartbeat: alice", labels=[cp.HEARTBEAT_LABEL]),
+        heartbeat_node(9, "alice", labels=[cp.HEARTBEAT_LABEL, cp.REQUEST_LABEL]),
+        node(9, "alice", cp.heartbeat_body("alice", NOW), title="Copilot review: octo/repo#3", labels=[cp.HEARTBEAT_LABEL]),
+    ],
+    ids=["request-body", "request-label", "other-title"],
+)
+def test_heartbeat_never_adopts_or_counts_lookalikes(tmp_path, lookalike):
+    gh = heartbeat_gh()
+    gh.issues[cp.HEARTBEAT_LABEL] = [lookalike]
     pool = make_pool(gh, tmp_path)
     assert pool.last_seen({"alice"}) == {}
     pool.heartbeat()
@@ -539,7 +577,14 @@ def test_heartbeat_ignores_relabelled_issues(tmp_path):
 
 
 def test_board_failure_does_not_suppress_heartbeat(tmp_path):
-    gh = FakeGitHub({**pool_routes(), BOARD: cp.GitHubError(500, "boom"), ("GET", "/user/repository_invitations"): []})
+    gh = FakeGitHub(
+        {
+            **pool_routes(),
+            BOARD: cp.GitHubError(500, "boom"),
+            ("GET", "/user/repository_invitations"): [],
+            ("POST", f"/repos/{POOL}/issues"): {"number": 42},
+        }
+    )
     make_pool(gh, tmp_path).run_once()
     (_, _, created, _), = gh.called("POST", f"/repos/{POOL}/issues")
     assert created["labels"] == [cp.HEARTBEAT_LABEL]

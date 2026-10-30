@@ -70,6 +70,7 @@ query($owner: String!, $name: String!, $labels: [String!], $states: [IssueState!
         author { login }
         editor { login }
         assignees(first: 10) { nodes { login } }
+        labels(first: 20) { nodes { name } }
       }
     }
   }
@@ -206,6 +207,8 @@ class State:
     served: dict = field(default_factory=dict)
     # collaborator invites this member sent and still has to revoke
     invites: list = field(default_factory=list)
+    # The heartbeat issue this member created; the only issue the heartbeat ever edits.
+    heartbeat_issue: int = 0
 
     @classmethod
     def load(cls, path):
@@ -354,9 +357,19 @@ def request_pr(issue):
         return None
 
 
+def heartbeat_body(user, now):
+    return f"@{user}'s copilot_pool.py was running at {now.isoformat(timespec='seconds')}."
+
+
 def is_own_heartbeat(issue):
-    # The label alone isn't attributable (anyone can label any issue), so also require the title we create.
-    return issue["author"] is not None and issue.get("title") == f"pool-heartbeat: {issue['author']}"
+    # Label and title can be changed by any member, so also require the body we write and no request label.
+    author = issue["author"]
+    return (
+        author is not None
+        and issue.get("title") == f"pool-heartbeat: {author}"
+        and REQUEST_LABEL not in issue.get("labels", [])
+        and re.fullmatch(rf"@{re.escape(author)}'s copilot_pool\.py was running at \S+\.", issue["body"] or "") is not None
+    )
 
 
 def edited_by_author(issue):
@@ -473,6 +486,7 @@ class Pool:
                         "author": (node.get("author") or {}).get("login"),
                         "editor": (node.get("editor") or {}).get("login"),
                         "assignees": [a["login"] for a in node["assignees"]["nodes"]],
+                        "labels": [lbl["name"] for lbl in (node.get("labels") or {}).get("nodes", [])],
                     }
                 )
             if not conn["pageInfo"]["hasNextPage"]:
@@ -586,17 +600,29 @@ class Pool:
         now = self.clock()
         if self._last_heartbeat and (now - self._last_heartbeat).total_seconds() < self.cfg.heartbeat_interval:
             return
-        body = f"@{self.me}'s copilot_pool.py was running at {now.isoformat(timespec='seconds')}."
-        # Match by author alone so a heartbeat someone else tampered with gets overwritten, not duplicated.
-        mine = [i for i in self.pool_issues(HEARTBEAT_LABEL) if i["author"] == self.me and is_own_heartbeat(i)]
-        if mine:
-            self.gh.request("PATCH", f"/repos/{self.cfg.pool_repo}/issues/{mine[0]['number']}", {"body": body})
-        else:
-            self.gh.request(
+        body = heartbeat_body(self.me, now)
+        number = self.state.heartbeat_issue
+        if not number:
+            # One-time adoption of a heartbeat issue created before its number was recorded.
+            # is_own_heartbeat matches regardless of last editor, so a tampered one is overwritten, not duplicated.
+            mine = [i for i in self.pool_issues(HEARTBEAT_LABEL) if i["author"] == self.me and is_own_heartbeat(i)]
+            number = mine[0]["number"] if mine else 0
+        if number:
+            try:
+                self.gh.request("PATCH", f"/repos/{self.cfg.pool_repo}/issues/{number}", {"body": body})
+            except GitHubError as e:
+                if e.status not in (404, 410):
+                    raise
+                number = 0  # deleted; start a new one
+        if not number:
+            number = self.gh.request(
                 "POST",
                 f"/repos/{self.cfg.pool_repo}/issues",
                 {"title": f"pool-heartbeat: {self.me}", "body": body, "labels": [HEARTBEAT_LABEL]},
-            )
+            )["number"]
+        if number != self.state.heartbeat_issue:
+            with self.mutate_state() as state:
+                state.heartbeat_issue = number
         self._last_heartbeat = now
 
     def retire_legacy_status_issues(self):

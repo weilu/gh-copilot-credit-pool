@@ -47,8 +47,7 @@ Your files live in `~/.config/copilot-pool/`. Set `COPILOT_POOL_HOME` to use a d
 
 ```sh
 ./copilot_pool.py run                         # keep this running (tmux, launchd, systemd…)
-./copilot_pool.py request https://github.com/o/r/pull/12
-./copilot_pool.py request o/r#12 --via-pool   # borrow even if you still have credits
+./copilot_pool.py request https://github.com/o/r/pull/12   # or o/r#12
 ./copilot_pool.py status                      # credits, last change and last seen for each member
 ```
 
@@ -98,7 +97,11 @@ as available.
     open state, so a tampered heartbeat gets repaired;
   - accepts a repo invitation only when the inviter is a pool member with an open request for a PR
     in that repo;
-  - handles open `copilot-request` issues assigned to it. It requests
+  - handles open `copilot-request` issues assigned to it. It declines if the requester's README row
+    shows they still have at least `credits_per_review` credits of their own (monthly minus used, as
+    reported by Copilot). That covers people who bypass `request`, and those below their own lending
+    floor, who show 0 to lend but can still pay for their own reviews. If the requester has no row,
+    or only a local estimate, the helper can't tell and goes ahead. Otherwise it requests
     `copilot-pull-request-reviewer[bot]` on the PR, comments, and closes the issue. It acts only when
     the requester wrote the PR or can request reviewers on it, because the helper's token may reach
     repos the requester can't. Any failure is retried until `access_timeout`, then the issue is
@@ -109,8 +112,9 @@ as available.
     always removed within `access_timeout + review_grace` (2h) of the invite, whatever state the
     request is in. The invite is recorded before it's sent, and withdrawn if opening the request
     issue fails.
-- `request` uses your own credits if you have at least `credits_per_review` left. Otherwise it picks
-  the member with the most credits, among those with at least `credits_per_review` left and a
+- `request` uses your own credits whenever you have at least `credits_per_review` left. Borrowing is
+  only for members who can't afford a review themselves. When you can't, it first updates your README
+  row so helpers see that you're out, then picks the member with the most credits, among those with at least `credits_per_review` left and a
   heartbeat within `stale_after`. If that member can't request reviewers on the repo, it invites
   them, with the `triage` role on org repos and as a regular collaborator on personal repos. Then it
   opens a request issue assigned to them.

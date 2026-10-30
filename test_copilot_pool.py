@@ -385,6 +385,69 @@ def test_request_review_borrows_when_own_credits_below_one_review(tmp_path):
     assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
 
 
+def test_request_review_never_borrows_when_own_credits_suffice(tmp_path):
+    gh = FakeGitHub(
+        {("POST", "/repos/octo/repo/pulls/3/requested_reviewers"): {"requested_reviewers": [{"login": "Copilot"}]}}
+    )
+    pool = make_pool(gh, tmp_path, used=11800, quota=11900, credits_per_review=100)
+    assert "your own credits" in pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+    assert not gh.called("POST", f"/repos/{POOL}/issues")
+
+
+def test_request_review_refreshes_own_row_before_borrowing(tmp_path):
+    routes = pool_routes(members=("alice", "carol"))
+    routes.update(
+        {
+            ("GET", "/repos/octo/repo/collaborators/carol/permission"): {"role_name": "write"},
+            ("POST", f"/repos/{POOL}/issues"): {"number": 9, "html_url": "u"},
+        }
+    )
+    # alice's row is stale (claims 5000 left); she has 50 now.
+    gh = with_board(FakeGitHub(routes), entry("carol", 500, quota=11900), entry("alice", 5000, quota=11900))
+    pool = make_pool(gh, tmp_path, used=11850, quota=11900, credits_per_review=100)
+    pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+    _, board = put_board(gh)
+    assert board["alice"]["used"] == 11850
+    order = [c[0] + " " + c[1] for c in gh.calls if c[0] in ("PUT", "POST")]
+    assert order.index(f"PUT /repos/{POOL}/contents/README.md") < order.index(f"POST /repos/{POOL}/issues")
+
+
+@pytest.mark.parametrize(
+    "requester_row, serves",
+    [
+        (entry("alice", 0, quota=11900, used=11800), False),  # 100 of her own: at the pool minimum
+        (entry("alice", 0, quota=11900, used=11801), True),  # 99: below it
+        (entry("alice", 0, quota=11900, used=0, source="local-count"), True),  # estimate: unknown
+        (None, True),  # no row: unknown
+        ({**entry("alice", 0, quota=11900, used=0), "updated_at": "garbage"}, True),  # invalid row: unknown
+    ],
+    ids=["has-enough", "just-below", "local-estimate", "no-row", "invalid-row"],
+)
+def test_helper_declines_requester_with_enough_own_credits(tmp_path, requester_row, serves):
+    gh = helper_gh()
+    with_board(gh, *([requester_row] if requester_row else []))
+    pool = make_pool(gh, tmp_path, me="bob", credits_per_review=100, quota=11900)
+    pool.handle_request(as_issue(request_node()), MEMBERS)
+    assert bool(gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")) is serves
+    if not serves:
+        (_, _, comment, _), = gh.called("POST", f"/repos/{POOL}/issues/7/comments")
+        assert "100 Copilot credits of your own" in comment["body"]
+
+
+def test_helper_check_ignores_requesters_lending_floor(tmp_path):
+    # alice advertises 0 (below her own min_credits_to_lend) but still has 300 to spend herself.
+    gh = helper_gh()
+    with_board(gh, entry("alice", 0, quota=11900, used=11600))
+    pool = make_pool(gh, tmp_path, me="bob", credits_per_review=100, quota=11900)
+    pool.handle_request(as_issue(request_node()), MEMBERS)
+    assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
+
+
+def test_request_has_no_via_pool_flag():
+    with pytest.raises(SystemExit):
+        cp.main(["request", "octo/repo#3", "--via-pool"])
+
+
 def test_helper_declines_when_below_one_review(tmp_path):
     gh = helper_gh()
     pool = make_pool(gh, tmp_path, me="bob", used=11850, quota=11900, credits_per_review=100)
@@ -1158,7 +1221,7 @@ def test_request_review_records_invite_before_granting(tmp_path):
     real = gh.request
 
     def spy(method, path, body=None, params=None):
-        if method == "PUT":
+        if method == "PUT" and "/collaborators/" in path:
             recorded_before_put.append(len(disk_state(pool).invites))
         return real(method, path, body, params)
 

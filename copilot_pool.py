@@ -582,6 +582,8 @@ class Pool:
             if e.status == 404:
                 return {}, None
             raise
+        if not isinstance(resp, dict):
+            return {}, None
         try:
             text = base64.b64decode(resp["content"]).decode()
         except (KeyError, TypeError, ValueError):
@@ -600,6 +602,15 @@ class Pool:
                 if author not in seen or parse_time(stamp) > parse_time(seen[author]):
                     seen[author] = stamp
         return seen
+
+    def own_credits_of(self, member):
+        """Credits `member` has of their own per Copilot, from their board row; None if unknown."""
+        entry = valid_status(self.read_board()[0].get(member), member, self.clock())
+        # A local estimate overstates credits, and "remaining" is 0 below a member's lending floor,
+        # so only Copilot-reported quota minus usage says what they can spend themselves.
+        if entry is None or entry["source"] != "copilot":
+            return None
+        return max(0, entry["quota"] - entry["used"])
 
     def read_statuses(self, members):
         now = self.clock()
@@ -741,6 +752,16 @@ class Pool:
             self._close(number, "Already handled.")
             return
 
+        own = self.own_credits_of(requester)
+        if own is not None and own >= self.credits_per_review:
+            self._close(
+                number,
+                f"@{requester} you still have {own} Copilot credits of your own (pool minimum per review: "
+                f"{self.credits_per_review}). Use those first; `request` does so automatically.",
+                "not_planned",
+            )
+            return
+
         limit = self.cfg.max_requests_per_requester_per_day
         if limit and len(self._served_recently(requester)) >= limit:
             self._close(
@@ -856,15 +877,18 @@ class Pool:
                 log.error("Dropping unrevocable invite record %s (missing %s)", inv, e)
                 self.forget_invite(inv["id"])
 
-    def request_review(self, pr, via_pool=False):
+    def request_review(self, pr):
         """Requester side. Returns a human-readable outcome."""
-        if not via_pool and self.remaining() >= self.credits_per_review:
+        # Borrowing is only for members who can't afford a review themselves.
+        if self.remaining() >= self.credits_per_review:
             listed = request_copilot(self.gh, pr)
             self.record_usage()
             suffix = "" if listed else " (GitHub didn't list Copilot as a reviewer; check your Copilot plan)"
             return f"Requested Copilot review on {pr.url} with your own credits{suffix}"
 
         members = self.members()
+        # Refresh our row first so helpers checking it see that we're out, not a value up to a cycle old.
+        self.publish_status(members)
         peer = pick_peer(
             self.read_statuses(members), self.me, self.clock(), self.cfg.stale_after, self.credits_per_review
         )
@@ -1037,7 +1061,7 @@ def cmd_run(args):
 
 
 def cmd_request(args):
-    print(build_pool().request_review(parse_pr_ref(args.pr), via_pool=args.via_pool))
+    print(build_pool().request_review(parse_pr_ref(args.pr)))
 
 
 def cmd_status(args):
@@ -1063,7 +1087,6 @@ def main(argv=None):
     sub.add_parser("status").set_defaults(func=cmd_status)
     req = sub.add_parser("request")
     req.add_argument("pr", help="PR URL or owner/repo#number")
-    req.add_argument("--via-pool", action="store_true", help="use a pool member even if you have credits")
     req.set_defaults(func=cmd_request)
     args = parser.parse_args(argv)
     logging.basicConfig(

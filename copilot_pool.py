@@ -17,6 +17,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import getpass
+import hashlib
 import json
 import logging
 import os
@@ -190,9 +191,15 @@ class State:
     @classmethod
     def load(cls, path):
         try:
-            return cls(**json.loads(Path(path).read_text()))
+            state = cls(**json.loads(Path(path).read_text()))
         except FileNotFoundError:
             return cls()
+        for invite in state.invites:
+            # Records from older versions lack an id. Derive one from the content so it stays the same
+            # across reloads and the record can still be revoked and removed.
+            if "id" not in invite:
+                invite["id"] = hashlib.sha256(json.dumps(invite, sort_keys=True).encode()).hexdigest()[:32]
+        return state
 
     def save(self, path):
         path = Path(path)
@@ -597,7 +604,10 @@ class Pool:
         log.info("Requested Copilot review on %s for %s", pr.url, requester)
 
     def _invite_still_needed(self, inv, open_requests):
-        age = self.clock() - parse_time(inv["created_at"])
+        try:
+            age = self.clock() - parse_time(inv["created_at"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False  # fail closed: an invite we can't date gets revoked
         # Hard cap so no request state, open issue or tampering can keep access alive indefinitely.
         if age >= dt.timedelta(seconds=self.cfg.access_timeout + self.cfg.review_grace):
             return False
@@ -611,7 +621,7 @@ class Pool:
                 and pr.full_name.lower() == inv["repo"].lower()
             ):
                 return True
-        if inv["issue"] is None:
+        if inv.get("issue") is None:
             # `request` is between sending the invite and opening the issue, or crashed in between.
             return age < PENDING_INVITE_GRACE
         try:
@@ -644,7 +654,7 @@ class Pool:
 
     def forget_invite(self, invite_id):
         with self.mutate_state() as state:
-            state.invites = [i for i in state.invites if i["id"] != invite_id]
+            state.invites = [i for i in state.invites if i.get("id") != invite_id]
 
     def cleanup_invites(self, open_requests):
         for inv in list(self.state.invites):
@@ -653,8 +663,12 @@ class Pool:
                     continue
                 self.revoke_invite(inv)
                 self.forget_invite(inv["id"])
-            except (GitHubError, KeyError, ValueError) as e:
+            except GitHubError as e:
                 log.error("Couldn't revoke @%s's access to %s: %s", inv.get("helper"), inv.get("repo"), e)
+            except KeyError as e:
+                # Without a repo or helper there is nothing to revoke; keeping it would log forever.
+                log.error("Dropping unrevocable invite record %s (missing %s)", inv, e)
+                self.forget_invite(inv["id"])
 
     def request_review(self, pr, via_pool=False):
         """Requester side. Returns a human-readable outcome."""

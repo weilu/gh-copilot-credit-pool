@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 import urllib.request
 
@@ -728,6 +729,28 @@ def test_request_review_keeps_record_when_rollback_fails(tmp_path):
         pool.request_review(cp.parse_pr_ref("octo/repo#3"))
     (record,) = disk_state(pool).invites
     assert record["issue"] is None and record["helper"] == "carol"
+
+
+def test_cleanup_revokes_old_format_invite_records(tmp_path):
+    pool = make_pool(cleanup_gh(closed_issue()), tmp_path)
+    pool.state_path.write_text(json.dumps({"invites": [{"issue": 9, "repo": "octo/repo", "pr": 3, "helper": "carol"}]}))
+    pool.reload_state()
+    pool.cleanup_invites([])
+    assert pool.gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
+    assert disk_state(pool).invites == []
+
+
+@pytest.mark.parametrize("created_at", [None, "garbage", 5])
+def test_cleanup_revokes_undatable_invites(tmp_path, created_at):
+    gh = cleanup_gh({"state": "open"})
+    state = run_cleanup(gh, tmp_path, invite={**INVITE, "created_at": created_at})
+    assert gh.called("DELETE", "/repos/octo/repo/collaborators/carol")
+    assert state.invites == []
+
+
+def test_cleanup_drops_unrevocable_invite_records(tmp_path):
+    state = run_cleanup(cleanup_gh(None), tmp_path, invite={"id": "x", "created_at": "garbage"})
+    assert state.invites == []
 
 
 # --- concurrency between `request` and `run` -----------------------------------

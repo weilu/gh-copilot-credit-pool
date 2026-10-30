@@ -55,7 +55,7 @@ def status_body(user, remaining, updated_at=NOW, quota=300, **extra):
         "remaining": remaining,
         "quota": quota,
         "used": quota - remaining if isinstance(remaining, int) else 0,
-        "source": "billing-api",
+        "source": "copilot",
         "updated_at": updated_at.isoformat() if isinstance(updated_at, dt.datetime) else updated_at,
         **extra,
     }
@@ -92,16 +92,30 @@ def pool_routes(members=("alice", "bob"), owner_type="User", private=True):
     }
 
 
-def make_pool(gh, tmp_path, me="alice", used=0, quota=300, billing=True, **cfg):
-    config = cp.Config(username=me, pool_repo=POOL, monthly_quota=quota, token="t", **cfg)
-    billing_gh = FakeGitHub(
-        {
-            ("GET", f"/users/{me}/settings/billing/premium_request/usage"): {
-                "usageItems": [{"product": "Copilot", "grossQuantity": used}]
+def quota_snapshot(used, entitlement, unlimited=False):
+    return {
+        "login": "x",
+        "quota_snapshots": {
+            "premium_interactions": {
+                "entitlement": entitlement,
+                "remaining": entitlement - used,
+                "credits_used": used,
+                "overage_permitted": False,
+                "unlimited": unlimited,
             }
-        }
+        },
+    }
+
+
+def make_pool(gh, tmp_path, me="alice", used=0, quota=300, copilot=True, **cfg):
+    """`used`/`quota` are what the Copilot endpoint reports; reviews cost 1 credit unless overridden."""
+    cfg.setdefault("credits_per_review", 1)
+    config = cp.Config(username=me, pool_repo=POOL, monthly_credits=quota, token="t", **cfg)
+    gh.routes.setdefault(
+        ("GET", cp.COPILOT_USER_ENDPOINT),
+        quota_snapshot(used, quota) if copilot else cp.GitHubError(404, "Not Found"),
     )
-    return cp.Pool(config, gh, billing_gh if billing else None, cp.State(), tmp_path / "state.json", clock=lambda: NOW)
+    return cp.Pool(config, gh, cp.State(), tmp_path / "state.json", clock=lambda: NOW)
 
 
 def seed_state(pool, **fields):
@@ -238,26 +252,79 @@ def test_check_pool_repo_refuses_public(tmp_path):
 # --- credits -------------------------------------------------------------------
 
 
-def test_remaining_from_billing_api(tmp_path):
-    assert make_pool(FakeGitHub(), tmp_path, used=280.5).remaining() == 19
+def test_remaining_from_copilot_endpoint(tmp_path):
+    pool = make_pool(FakeGitHub(), tmp_path, used=11000, quota=11900)
+    assert pool.usage() == (11000, 11900, "copilot")
+    assert pool.remaining() == 900
 
 
-def test_remaining_falls_back_to_local_count_when_billing_fails(tmp_path):
-    pool = make_pool(FakeGitHub(), tmp_path)
-    pool.billing_gh = FakeGitHub(
-        {("GET", "/users/alice/settings/billing/premium_request/usage"): cp.GitHubError(403, "no")}
-    )
-    pool.state.month = "2026-10"
-    pool.state.requested_count = 299
-    assert pool.remaining() == 1
-    assert pool.billing_gh is None
+def test_remaining_ignores_overage_and_bad_values(tmp_path):
+    gh = FakeGitHub({("GET", cp.COPILOT_USER_ENDPOINT): quota_snapshot(-500, 11900)})
+    assert make_pool(gh, tmp_path).remaining() == 11900
+    gh = FakeGitHub({("GET", cp.COPILOT_USER_ENDPOINT): quota_snapshot(12000, 11900)})
+    assert make_pool(gh, tmp_path).remaining() == 0
+
+
+def test_remaining_unlimited(tmp_path):
+    gh = FakeGitHub({("GET", cp.COPILOT_USER_ENDPOINT): quota_snapshot(0, 0, unlimited=True)})
+    assert make_pool(gh, tmp_path).remaining() == cp.UNLIMITED_CREDITS
+
+
+@pytest.mark.parametrize(
+    "response",
+    [cp.GitHubError(404, "Not Found"), {"login": "x"}, {"quota_snapshots": {"premium_interactions": {"entitlement": "?"}}}],
+)
+def test_remaining_falls_back_to_local_count_in_credits(tmp_path, response):
+    gh = FakeGitHub({("GET", cp.COPILOT_USER_ENDPOINT): response})
+    pool = make_pool(gh, tmp_path, quota=11900, credits_per_review=90)
+    seed_state(pool, month="2026-10", requested_count=100)
+    assert pool.usage() == (9000, 11900, "local-count")
+    assert pool.remaining() == 2900
 
 
 def test_local_count_resets_each_month(tmp_path):
-    pool = make_pool(FakeGitHub(), tmp_path, billing=False)
-    pool.state.month = "2026-09"
-    pool.state.requested_count = 300
+    pool = make_pool(FakeGitHub(), tmp_path, copilot=False)
+    seed_state(pool, month="2026-09", requested_count=300)
     assert pool.remaining() == 300
+
+
+def test_pick_peer_requires_enough_credits_for_a_review():
+    statuses = [
+        {"username": "bob", "remaining": 99, "updated_at": NOW.isoformat()},
+        {"username": "carol", "remaining": 100, "updated_at": NOW.isoformat()},
+    ]
+    assert cp.pick_peer(statuses, "alice", NOW, 900, min_credits=100) == "carol"
+    assert cp.pick_peer(statuses[:1], "alice", NOW, 900, min_credits=100) is None
+
+
+def test_request_review_borrows_when_own_credits_below_one_review(tmp_path):
+    routes = pool_routes(members=("alice", "carol"))
+    routes.update(
+        {
+            ("GET", "/repos/octo/repo/collaborators/carol/permission"): {"role_name": "write"},
+            ("POST", f"/repos/{POOL}/issues"): {"number": 9, "html_url": "u"},
+        }
+    )
+    gh = FakeGitHub(routes, issues={cp.STATUS_LABEL: [status_node("carol", 500, quota=11900)]})
+    pool = make_pool(gh, tmp_path, used=11850, quota=11900, credits_per_review=100)
+    assert "@carol" in pool.request_review(cp.parse_pr_ref("octo/repo#3"))
+    assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
+
+
+def test_helper_declines_when_below_one_review(tmp_path):
+    gh = helper_gh()
+    pool = make_pool(gh, tmp_path, me="bob", used=11850, quota=11900, credits_per_review=100)
+    pool.handle_request(as_issue(request_node()), MEMBERS)
+    assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
+    assert closes(gh)[0]["state_reason"] == "not_planned"
+
+
+def test_config_migrates_monthly_quota_and_drops_unknown_keys(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"username": "a", "pool_repo": POOL, "monthly_quota": 300, "billing_token": "x"}))
+    cfg = cp.Config.load(path)
+    assert cfg.monthly_credits == 300
+    assert not hasattr(cfg, "billing_token")
 
 
 # --- statuses ------------------------------------------------------------------
@@ -757,7 +824,7 @@ def test_cleanup_drops_unrevocable_invite_records(tmp_path):
 
 
 def test_daemon_write_does_not_lose_invite_recorded_by_request(tmp_path):
-    daemon = make_pool(FakeGitHub(), tmp_path, me="alice", billing=False)
+    daemon = make_pool(FakeGitHub(), tmp_path, me="alice", copilot=False)
     daemon.reload_state()
     gh = borrow_routes({"number": 9, "html_url": "u"})
     requester = make_pool(gh, tmp_path, me="alice", used=300)
@@ -824,7 +891,7 @@ def test_redirect_strips_token_when_origin_changes(target, keeps_auth):
 
 def test_config_roundtrip_is_private(tmp_path):
     path = tmp_path / "cfg" / "config.json"
-    cfg = cp.Config(username="a", pool_repo=POOL, monthly_quota=300, token="secret")
+    cfg = cp.Config(username="a", pool_repo=POOL, monthly_credits=300, token="secret")
     cfg.save(path)
     assert cp.Config.load(path) == cfg
     assert path.stat().st_mode & 0o777 == 0o600
@@ -834,7 +901,7 @@ def test_config_roundtrip_is_private(tmp_path):
 def test_config_save_locks_down_existing_directory(tmp_path):
     folder = tmp_path / "cfg"
     folder.mkdir(mode=0o755)
-    cp.Config(username="a", pool_repo=POOL, monthly_quota=300, token="secret").save(folder / "config.json")
+    cp.Config(username="a", pool_repo=POOL, monthly_credits=300, token="secret").save(folder / "config.json")
     assert folder.stat().st_mode & 0o777 == 0o700
 
 
@@ -852,7 +919,7 @@ def test_config_save_never_exposes_token_even_under_permissive_umask(tmp_path, m
     monkeypatch.setattr(os, "fdopen", spy)
     old = os.umask(0)
     try:
-        cp.Config(username="a", pool_repo=POOL, monthly_quota=300, token="secret").save(path)
+        cp.Config(username="a", pool_repo=POOL, monthly_credits=300, token="secret").save(path)
     finally:
         os.umask(old)
     assert modes == [0o600]

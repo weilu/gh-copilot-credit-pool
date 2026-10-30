@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 API = "https://api.github.com"
@@ -37,6 +37,9 @@ COPILOT_REVIEWER = "copilot-pull-request-reviewer[bot]"
 REQUEST_LABEL = "copilot-request"
 STATUS_LABEL = "pool-status"
 REVIEW_ROLES = {"triage", "write", "maintain", "admin"}
+# Undocumented endpoint the Copilot clients use; the only one that reports credits for org-paid seats too.
+COPILOT_USER_ENDPOINT = "/copilot_internal/user"
+UNLIMITED_CREDITS = 10**9
 CLOCK_SKEW = dt.timedelta(minutes=5)
 DAY = dt.timedelta(days=1)
 # How long an invite may exist before its request issue is opened.
@@ -138,10 +141,12 @@ def paginate(gh, path, params=None):
 class Config:
     username: str
     pool_repo: str
-    monthly_quota: int
+    # Only used when the Copilot endpoint is unreachable; otherwise the entitlement comes from GitHub.
+    monthly_credits: int
     token: str = ""
     token_command: str = ""
-    billing_token: str = ""
+    # Minimum credits a member needs to take on a review, and the local-count cost of one.
+    credits_per_review: int = 100
     poll_interval: int = 60
     heartbeat_interval: int = 300
     stale_after: int = 900
@@ -154,7 +159,12 @@ class Config:
 
     @classmethod
     def load(cls, path):
-        return cls(**json.loads(Path(path).read_text()))
+        data = json.loads(Path(path).read_text())
+        # Configs from before the switch to credits.
+        if "monthly_quota" in data:
+            data.setdefault("monthly_credits", data.pop("monthly_quota"))
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     def save(self, path):
         path = Path(path)
@@ -178,7 +188,7 @@ class Config:
 
 @dataclass
 class State:
-    """Local bookkeeping; the fallback usage count when the billing API is unavailable."""
+    """Local bookkeeping; the fallback usage count when the Copilot endpoint is unavailable."""
 
     month: str = ""
     requested_count: int = 0
@@ -318,13 +328,13 @@ def edited_by_author(issue):
     return issue["editor"] in (None, issue["author"])
 
 
-def pick_peer(statuses, me, now, stale_after):
-    """Pick the fresh, non-self member with the most remaining credits."""
+def pick_peer(statuses, me, now, stale_after, min_credits=1):
+    """Pick the fresh, non-self member with the most remaining credits, if they can afford a review."""
     candidates = [
         s
         for s in statuses
         if s["username"] != me
-        and s["remaining"] > 0
+        and s["remaining"] >= min_credits
         and (now - parse_time(s["updated_at"])).total_seconds() <= stale_after
     ]
     if not candidates:
@@ -358,10 +368,10 @@ def invite_collaborator(gh, pr, user):
 
 
 class Pool:
-    def __init__(self, config, gh, billing_gh, state, state_path, clock=utcnow):
+    def __init__(self, config, gh, state, state_path, clock=utcnow):
         self.cfg = config
         self.gh = gh
-        self.billing_gh = billing_gh
+        self._warned_fallback = False
         self.state = state
         self.state_path = state_path
         self.clock = clock
@@ -430,30 +440,27 @@ class Pool:
             cursor = conn["pageInfo"]["endCursor"]
 
     def usage(self):
-        """Return (premium requests used this month, source)."""
+        """Return (credits used this month, monthly credits, source)."""
+        try:
+            snapshot = self.gh.request("GET", COPILOT_USER_ENDPOINT)["quota_snapshots"]["premium_interactions"]
+            if snapshot.get("unlimited"):
+                return 0, UNLIMITED_CREDITS, "copilot"
+            entitlement = int(snapshot["entitlement"])
+            # Overage is deliberately ignored: lending must not run up someone's (or their org's) bill.
+            remaining = max(0, min(entitlement, int(snapshot["remaining"])))
+            self._warned_fallback = False
+            return entitlement - remaining, entitlement, "copilot"
+        except (GitHubError, KeyError, TypeError, ValueError) as e:
+            if not self._warned_fallback:
+                log.warning("Copilot quota endpoint unavailable (%s); estimating from local count", e)
+                self._warned_fallback = True
         now = self.clock()
-        if self.billing_gh is not None:
-            try:
-                data = self.billing_gh.request(
-                    "GET",
-                    f"/users/{self.me}/settings/billing/premium_request/usage",
-                    params={"year": now.year, "month": now.month},
-                )
-                used = sum(
-                    item.get("grossQuantity", 0)
-                    for item in data.get("usageItems", [])
-                    if item.get("product", "copilot").lower() == "copilot"
-                )
-                return used, "billing-api"
-            except GitHubError as e:
-                log.warning("Billing usage API unavailable (%s); using local count", e)
-                self.billing_gh = None
-        same_month = self.state.month == now.strftime("%Y-%m")
-        return (self.state.requested_count if same_month else 0), "local-count"
+        count = self.state.requested_count if self.state.month == now.strftime("%Y-%m") else 0
+        return count * self.cfg.credits_per_review, self.cfg.monthly_credits, "local-count"
 
     def remaining(self):
-        used, _ = self.usage()
-        return int(max(0, self.cfg.monthly_quota - used))
+        used, quota, _ = self.usage()
+        return max(0, quota - used)
 
     def record_usage(self):
         with self.mutate_state() as state:
@@ -472,8 +479,8 @@ class Pool:
         return statuses
 
     def publish_status(self, members):
-        used, source = self.usage()
-        remaining = int(max(0, self.cfg.monthly_quota - used))
+        used, quota, source = self.usage()
+        remaining = max(0, quota - used)
         now = self.clock()
         if (
             self._last_published
@@ -484,7 +491,7 @@ class Pool:
         status = {
             "username": self.me,
             "remaining": remaining,
-            "quota": self.cfg.monthly_quota,
+            "quota": quota,
             "used": used,
             "source": source,
             "updated_at": now.isoformat(timespec="seconds"),
@@ -563,10 +570,10 @@ class Pool:
                 "not_planned",
             )
             return
-        if self.remaining() <= 0:
+        if self.remaining() < self.cfg.credits_per_review:
             self._close(
                 number,
-                f"@{requester} sorry, @{self.me} is out of Copilot credits. Run `request` again to pick someone else.",
+                f"@{requester} sorry, @{self.me} doesn't have enough Copilot credits left for a review. Run `request` again to pick someone else.",
                 "not_planned",
             )
             return
@@ -672,16 +679,18 @@ class Pool:
 
     def request_review(self, pr, via_pool=False):
         """Requester side. Returns a human-readable outcome."""
-        if not via_pool and self.remaining() > 0:
+        if not via_pool and self.remaining() >= self.cfg.credits_per_review:
             listed = request_copilot(self.gh, pr)
             self.record_usage()
             suffix = "" if listed else " (GitHub didn't list Copilot as a reviewer; check your Copilot plan)"
             return f"Requested Copilot review on {pr.url} with your own credits{suffix}"
 
         members = self.members()
-        peer = pick_peer(self.read_statuses(members), self.me, self.clock(), self.cfg.stale_after)
+        peer = pick_peer(
+            self.read_statuses(members), self.me, self.clock(), self.cfg.stale_after, self.cfg.credits_per_review
+        )
         if peer is None:
-            raise SystemExit("No online pool member has credits left.")
+            raise SystemExit("No online pool member has enough credits left for a review.")
 
         invite = None
         if not has_review_access(self.gh, pr, peer):
@@ -761,18 +770,24 @@ def ensure_labels(gh, repo):
 
 def cmd_init(args):
     config_path = CONFIG_DIR / "config.json"
-    print("Repo token: a classic PAT with `repo` scope. Leave blank to use `gh auth token`.")
+    print("Token: a classic PAT with `repo` scope. Leave blank to use `gh auth token`.")
     token = getpass.getpass("Token: ").strip()
     token_command = "" if token else "gh auth token"
-    cfg = Config(username="", pool_repo="", monthly_quota=0, token=token, token_command=token_command)
+    cfg = Config(username="", pool_repo="", monthly_credits=0, token=token, token_command=token_command)
     gh = GitHub(cfg.resolve_token())
     login = gh.request("GET", "/user")["login"]
     print(f"Authenticated as {login}")
 
-    print("Optional billing token: fine-grained PAT with 'Plan: read' for accurate usage. Blank to skip.")
-    billing_token = getpass.getpass("Billing token: ").strip()
+    try:
+        snapshot = gh.request("GET", COPILOT_USER_ENDPOINT)["quota_snapshots"]["premium_interactions"]
+        monthly = int(snapshot["entitlement"])
+        print(f"Copilot reports {monthly} credits/month, {int(snapshot['remaining'])} remaining.")
+    except (GitHubError, KeyError, TypeError, ValueError) as e:
+        print(f"Couldn't read your Copilot credits ({e}); the script will estimate from its own count.")
+        monthly = int(input("Monthly Copilot credits: ").strip())
+
     pool_repo = input("Pool repo (owner/name): ").strip()
-    quota = input("Monthly premium request quota [300]: ").strip() or "300"
+    per_review = input("Credits one Copilot review costs (minimum a helper needs) [100]: ").strip() or "100"
     limit = input("Max requests you'll serve per member per day, 0 = unlimited [10]: ").strip() or "10"
 
     if not gh.request("GET", f"/repos/{pool_repo}").get("private"):
@@ -781,10 +796,10 @@ def cmd_init(args):
     cfg = Config(
         username=login,
         pool_repo=pool_repo,
-        monthly_quota=int(quota),
+        monthly_credits=monthly,
         token=token,
         token_command=token_command,
-        billing_token=billing_token,
+        credits_per_review=int(per_review),
         max_requests_per_requester_per_day=int(limit),
     )
     cfg.save(config_path)
@@ -797,9 +812,8 @@ def build_pool():
         raise SystemExit("Not configured; run `copilot_pool.py init` first.")
     cfg = Config.load(config_path)
     gh = GitHub(cfg.resolve_token())
-    billing_gh = GitHub(cfg.billing_token) if cfg.billing_token else gh
     state_path = CONFIG_DIR / "state.json"
-    pool = Pool(cfg, gh, billing_gh, State.load(state_path), state_path)
+    pool = Pool(cfg, gh, State.load(state_path), state_path)
     pool.check_pool_repo()
     return pool
 
@@ -824,11 +838,11 @@ def cmd_status(args):
     pool = build_pool()
     now = pool.clock()
     statuses = sorted(pool.read_statuses(pool.members()), key=lambda s: -s["remaining"])
-    print(f"{'member':<24}{'remaining':>10}{'quota':>8}  {'source':<12}last seen")
+    print(f"{'member':<24}{'credits left':>13}{'monthly':>9}  {'source':<12}last seen")
     for s in statuses:
         age = int((now - parse_time(s["updated_at"])).total_seconds())
         stale = " (stale)" if age > pool.cfg.stale_after else ""
-        print(f"{s['username']:<24}{s['remaining']:>10}{s['quota']:>8}  {s.get('source', '?'):<12}{age}s ago{stale}")
+        print(f"{s['username']:<24}{s['remaining']:>13}{s['quota']:>9}  {s.get('source', '?'):<12}{age}s ago{stale}")
 
 
 def main(argv=None):

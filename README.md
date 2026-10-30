@@ -20,12 +20,16 @@ Python 3.9+, standard library only. macOS/Linux (it uses `fcntl` file locks).
 ./copilot_pool.py init
 ```
 
-- **Repo token**: a classic PAT with `repo` scope, or leave blank to use `gh auth token`.
+- **Token**: a classic PAT with `repo` scope, or leave blank to use `gh auth token`.
   (Fine-grained PATs can't act on repos owned by other users, which helpers need.)
-- **Billing token** (optional): a fine-grained PAT with the *Plan: read* user permission, used to
-  read your real premium-request usage. Without it, the script counts the reviews it has requested
-  itself this month.
-- **Pool repo** and **monthly quota** (e.g. 300 for Copilot Pro, 1500 for Pro+).
+- **Credits** are read from Copilot's own account endpoint (`/copilot_internal/user`), the same one
+  the Copilot clients use. It works for personal plans and for seats paid by an organization, which
+  GitHub's billing API doesn't cover. It is undocumented and could change. If it fails, the script
+  estimates usage as (reviews it has requested this month) × `credits_per_review`, against the
+  monthly credits you enter. Spending beyond your allowance is never counted as available.
+- **Credits per review**: the least a member must have left to take a review, and the cost used for
+  that estimate (default 100). Lower it once you know what a review actually costs.
+- **Pool repo**.
 - **Rate limit**: the most requests you'll serve per member in any 24 hours (default 10, 0 = unlimited).
   It is enforced by your own script, so each member sets their own.
 
@@ -43,7 +47,7 @@ Config lives in `~/.config/copilot-pool/config.json` (mode 600). Override the di
 ## How it works
 
 - Every `poll_interval` (60s) the daemon:
-  - updates its `pool-status` issue in the pool repo with its remaining credits. It rewrites the
+  - updates its `pool-status` issue in the pool repo with its remaining Copilot credits. It rewrites the
     issue when the number changes, and at least every `heartbeat_interval`;
   - accepts a repo invitation only when the inviter is a pool member with an open request for a PR
     in that repo;
@@ -58,8 +62,9 @@ Config lives in `~/.config/copilot-pool/config.json` (mode 600). Override the di
     Access is always removed within `access_timeout + review_grace` (2h) of the invite, whatever
     state the request is in. The invite is recorded before it's sent, and withdrawn if opening the
     request issue fails.
-- `request` picks the member with the most remaining credits whose status is newer than
-  `stale_after` (15 min). If that member can't request reviewers on the repo, it invites them, with
+- `request` uses your own credits if you have at least `credits_per_review` left. Otherwise it picks
+  the member with the most credits, among those with at least `credits_per_review` left and a status
+  newer than `stale_after` (15 min). If that member can't request reviewers on the repo, it invites them, with
   the `triage` role on org repos and as a regular collaborator on personal repos. Then it opens a
   request issue assigned to them.
 
@@ -73,8 +78,9 @@ well-formed, have `remaining` between 0 and `quota`, and not be dated in the fut
 ## Caveats
 
 - Collaborator access is revoked by the requester's running script, so keep `run` running after `request`.
+- Org-paid seats: check that your organization allows lending its Copilot credits to outsiders.
 - Org repos may block outside collaborators. Copilot code review also has to be enabled for the helper.
-- A helper who runs out of credits declines the request. Run `request` again to pick the next member.
+- A helper without `credits_per_review` credits left declines the request. Run `request` again to pick the next member.
 
 ## Tests
 

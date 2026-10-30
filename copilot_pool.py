@@ -600,7 +600,7 @@ class Pool:
         now = self.clock()
         if self._last_heartbeat and (now - self._last_heartbeat).total_seconds() < self.cfg.heartbeat_interval:
             return
-        body = heartbeat_body(self.me, now)
+        fields = {"title": f"pool-heartbeat: {self.me}", "body": heartbeat_body(self.me, now), "labels": [HEARTBEAT_LABEL]}
         number = self.state.heartbeat_issue
         if not number:
             # One-time adoption of a heartbeat issue created before its number was recorded.
@@ -609,17 +609,20 @@ class Pool:
             number = mine[0]["number"] if mine else 0
         if number:
             try:
-                self.gh.request("PATCH", f"/repos/{self.cfg.pool_repo}/issues/{number}", {"body": body})
+                # Restate title, labels and open state every time so a closed, renamed or relabelled
+                # heartbeat is repaired instead of silently making this member look offline.
+                issue = self.gh.request(
+                    "PATCH", f"/repos/{self.cfg.pool_repo}/issues/{number}", {**fields, "state": "open"}
+                )
+                if (issue or {}).get("user", {}).get("login") != self.me:
+                    log.warning("Heartbeat issue #%s isn't ours; creating a new one", number)
+                    number = 0
             except GitHubError as e:
                 if e.status not in (404, 410):
                     raise
                 number = 0  # deleted; start a new one
         if not number:
-            number = self.gh.request(
-                "POST",
-                f"/repos/{self.cfg.pool_repo}/issues",
-                {"title": f"pool-heartbeat: {self.me}", "body": body, "labels": [HEARTBEAT_LABEL]},
-            )["number"]
+            number = self.gh.request("POST", f"/repos/{self.cfg.pool_repo}/issues", fields)["number"]
         if number != self.state.heartbeat_issue:
             with self.mutate_state() as state:
                 state.heartbeat_issue = number

@@ -507,7 +507,10 @@ def test_publish_status_gives_up_after_repeated_conflicts(tmp_path):
 
 
 def heartbeat_gh():
-    return FakeGitHub({**pool_routes(), ("POST", f"/repos/{POOL}/issues"): {"number": 42}})
+    gh = FakeGitHub({**pool_routes(), ("POST", f"/repos/{POOL}/issues"): {"number": 42}})
+    for n in (2, 5, 7, 42):
+        gh.routes.setdefault(("PATCH", f"/repos/{POOL}/issues/{n}"), {"number": n, "user": {"login": "alice"}})
+    return gh
 
 
 def test_heartbeat_creates_records_and_edits_only_that_issue(tmp_path):
@@ -526,6 +529,28 @@ def test_heartbeat_creates_records_and_edits_only_that_issue(tmp_path):
     assert gh.called("PATCH", f"/repos/{POOL}/issues/42")
     assert not gh.called("PATCH", f"/repos/{POOL}/issues/5")
     assert len(gh.called("POST", f"/repos/{POOL}/issues")) == 1
+
+
+def test_heartbeat_restores_title_labels_and_open_state(tmp_path):
+    gh = heartbeat_gh()
+    pool = make_pool(gh, tmp_path)
+    seed_state(pool, heartbeat_issue=2)
+    pool.heartbeat()
+    (_, _, patch, _), = gh.called("PATCH", f"/repos/{POOL}/issues/2")
+    assert patch["state"] == "open"
+    assert patch["title"] == "pool-heartbeat: alice"
+    assert patch["labels"] == [cp.HEARTBEAT_LABEL]
+    assert cp.is_own_heartbeat({"author": "alice", "title": patch["title"], "labels": patch["labels"], "body": patch["body"]})
+
+
+def test_heartbeat_replaces_recorded_issue_that_isnt_ours(tmp_path):
+    gh = heartbeat_gh()
+    gh.routes[("PATCH", f"/repos/{POOL}/issues/7")] = {"number": 7, "user": {"login": "bob"}}
+    pool = make_pool(gh, tmp_path)
+    seed_state(pool, heartbeat_issue=7)
+    pool.heartbeat()
+    assert gh.called("POST", f"/repos/{POOL}/issues")
+    assert disk_state(pool).heartbeat_issue == 42
 
 
 def test_heartbeat_is_throttled(tmp_path):

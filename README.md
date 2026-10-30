@@ -10,8 +10,9 @@ Python 3.9+, standard library only.
 ## Setup (once per pool)
 
 1. Create a **private** repo to act as the pool, e.g. `yourteam/copilot-pool`.
-2. Add every member as a collaborator on it. Collaborators of the pool repo *are* the pool:
-   only their invites are auto-accepted and only their requests are served.
+2. Add every member as a direct collaborator with write access. Those collaborators *are* the
+   pool, plus the owner if it's a personal repo. People who only have access through org or team
+   membership are not members. The script refuses to run if the pool repo is public.
 
 ## Setup (once per member)
 
@@ -25,6 +26,8 @@ Python 3.9+, standard library only.
   read your real premium-request usage. Without it, the script counts the reviews it has requested
   itself this month.
 - **Pool repo** and **monthly quota** (e.g. 300 for Copilot Pro, 1500 for Pro+).
+- **Rate limit**: the most requests you'll serve per member in any 24 hours (default 10, 0 = unlimited).
+  It is enforced by your own script, so each member sets their own.
 
 Config lives in `~/.config/copilot-pool/config.json` (mode 600). Override the directory with `COPILOT_POOL_HOME`.
 
@@ -42,18 +45,31 @@ Config lives in `~/.config/copilot-pool/config.json` (mode 600). Override the di
 - Every `poll_interval` (60s) the daemon:
   - updates its `pool-status` issue in the pool repo with its remaining credits. It rewrites the
     issue when the number changes, and at least every `heartbeat_interval`;
-  - accepts repo invitations whose inviter is a pool member;
+  - accepts a repo invitation only when the inviter is a pool member with an open request for a PR
+    in that repo;
   - handles open `copilot-request` issues assigned to it. It requests
-    `copilot-pull-request-reviewer[bot]` on the PR, comments, and closes the issue. If its access
-    hasn't arrived yet, it retries for up to `access_timeout` (1h).
+    `copilot-pull-request-reviewer[bot]` on the PR, comments, and closes the issue. It acts only when
+    the requester wrote the PR or can request reviewers on it, because the helper's token may reach
+    repos the requester can't. Any failure is retried until `access_timeout` (1h), then the issue is
+    closed with the same generic message whatever the cause. That way a request can't be used to
+    find out about PRs the helper can see and the requester can't;
+  - removes collaborator access it granted for its own requests once they're done. A completed
+    request first waits for Copilot's review, or `review_grace` (1h), whichever comes first.
 - `request` picks the member with the most remaining credits whose status is newer than
   `stale_after` (15 min). If that member can't request reviewers on the repo, it invites them, with
   the `triage` role on org repos and as a regular collaborator on personal repos. Then it opens a
   request issue assigned to them.
 
+## Trust and tampering
+
+Anyone with write access to the pool repo can edit any issue in it, and GitHub can't restrict that.
+So the script ignores status and request issues that were last edited by someone other than their
+author. Your own script overwrites a tampered status on its next update. A status must also be
+well-formed, have `remaining` between 0 and `quota`, and not be dated in the future.
+
 ## Caveats
 
-- Invited helpers stay collaborators on your repo until you remove them.
+- Collaborator access is revoked by the requester's running script, so keep `run` running after `request`.
 - Org repos may block outside collaborators. Copilot code review also has to be enabled for the helper.
 - A helper who runs out of credits declines the request. Run `request` again to pick the next member.
 

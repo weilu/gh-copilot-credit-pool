@@ -49,8 +49,11 @@ Config lives in `~/.config/copilot-pool/config.json` (mode 600). Override the di
 ## How it works
 
 - Every `poll_interval` (60s) the daemon:
-  - updates its `pool-status` issue in the pool repo with its remaining Copilot credits. It rewrites the
-    issue when the number changes, and at least every `heartbeat_interval`;
+  - checks its own row in the pool repo's `README.md`, a table of every member's credits. It commits
+    a new row only when its remaining, monthly, used or source value has changed. If another member
+    committed in the meantime, it rereads the file and tries again;
+  - edits its own `pool-heartbeat` issue every `heartbeat_interval` (5 min), which creates no commit.
+    GitHub's record of when that issue was last edited is the member's "last seen" time;
   - accepts a repo invitation only when the inviter is a pool member with an open request for a PR
     in that repo;
   - handles open `copilot-request` issues assigned to it. It requests
@@ -65,17 +68,26 @@ Config lives in `~/.config/copilot-pool/config.json` (mode 600). Override the di
     state the request is in. The invite is recorded before it's sent, and withdrawn if opening the
     request issue fails.
 - `request` uses your own credits if you have at least `credits_per_review` left. Otherwise it picks
-  the member with the most credits, among those with at least `credits_per_review` left and a status
-  newer than `stale_after` (15 min). If that member can't request reviewers on the repo, it invites them, with
+  the member with the most credits, among those with at least `credits_per_review` left and a
+  heartbeat within `stale_after` (15 min). If that member can't request reviewers on the repo, it invites them, with
   the `triage` role on org repos and as a regular collaborator on personal repos. Then it opens a
   request issue assigned to them.
 
 ## Trust and tampering
 
-Anyone with write access to the pool repo can edit any issue in it, and GitHub can't restrict that.
-So the script ignores status and request issues that were last edited by someone other than their
-author. Your own script overwrites a tampered status on its next update. A status must also be
-well-formed, have `remaining` between 0 and `quota`, and not be dated in the future.
+Anyone with write access to the pool repo can edit any issue or file in it, and GitHub can't restrict
+that.
+
+- **Heartbeat and request issues** count only if they were last edited by their author, and
+  "last seen" uses GitHub's own edit time.
+- **The README board** can't be attributed: our tests showed that API commits are unsigned and can
+  carry any author. So rows are treated as hints for choosing a helper. Rows are validated: known
+  fields only, numbers within range, nothing dated in the future. Each member's script rewrites its
+  own row if it doesn't match. A tampered row can at worst send a request to the wrong member or keep
+  someone from being picked. The helper's own script still checks its real credits, the rate limit
+  and the requester's access before spending anything.
+
+On first `run`, the script closes the member's old `pool-status` issue from earlier versions.
 
 ## Caveats
 

@@ -1,3 +1,4 @@
+import base64
 import datetime as dt
 import json
 import os
@@ -38,32 +39,49 @@ class FakeGitHub:
         return [c for c in self.calls if c[0] == method and c[1] == path]
 
 
-def node(number, author, body, editor=None, assignees=(), created_at=NOW):
+def node(number, author, body, editor=None, assignees=(), created_at=NOW, edited_at=None):
     return {
         "number": number,
         "body": body,
         "createdAt": created_at.isoformat(),
+        "lastEditedAt": edited_at.isoformat() if edited_at else None,
         "author": {"login": author} if author else None,
         "editor": {"login": editor} if editor else None,
         "assignees": {"nodes": [{"login": a} for a in assignees]},
     }
 
 
-def status_body(user, remaining, updated_at=NOW, quota=300, **extra):
-    data = {
+def entry(user, remaining, quota=300, used=None, source="copilot", updated_at=NOW):
+    return {
         "username": user,
         "remaining": remaining,
         "quota": quota,
-        "used": quota - remaining if isinstance(remaining, int) else 0,
-        "source": "copilot",
+        "used": quota - remaining if used is None and isinstance(remaining, int) else (used or 0),
+        "source": source,
         "updated_at": updated_at.isoformat() if isinstance(updated_at, dt.datetime) else updated_at,
-        **extra,
     }
-    return cp.json_block(data)
 
 
-def status_node(user, remaining, number=1, author=None, editor=None, **kw):
-    return node(number, author or user, status_body(user, remaining, **kw), editor=editor)
+BOARD = ("GET", f"/repos/{POOL}/contents/README.md")
+BOARD_PUT = ("PUT", f"/repos/{POOL}/contents/README.md")
+
+
+def with_board(gh, *entries, online=None, text=None, sha="s1"):
+    """Serve a README board with `entries` and heartbeats for `online` members (default: all of them)."""
+    if text is None:
+        text = cp.render_board({e["username"]: e for e in entries})
+    gh.routes[BOARD] = {"content": base64.b64encode(text.encode()).decode(), "sha": sha}
+    users = [e["username"] for e in entries] if online is None else online
+    gh.issues[cp.HEARTBEAT_LABEL] = [
+        node(100 + i, u, "alive", edited_at=NOW - dt.timedelta(minutes=1)) for i, u in enumerate(users)
+    ]
+    return gh
+
+
+def put_board(gh, index=-1):
+    """Decode the board written by the index-th README PUT."""
+    body = gh.called(*BOARD_PUT)[index][2]
+    return body, cp.extract_json_block(base64.b64decode(body["content"]).decode())
 
 
 def request_node(pr=PR, requester="alice", helper="bob", number=7, created_at=NOW, editor=None):
@@ -186,18 +204,32 @@ def test_valid_status_rejects_malformed(data):
 
 
 def test_valid_status_accepts_small_clock_skew():
-    data = {"username": "bob", "remaining": 10, "quota": 300, "updated_at": (NOW + dt.timedelta(minutes=1)).isoformat()}
+    data = entry("bob", 10, updated_at=NOW + dt.timedelta(minutes=1))
     assert cp.valid_status(data, "bob", NOW) == data
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"used": -1}, {"used": "x"}, {"source": "made-up"}, {"source": None}],
+)
+def test_valid_status_rejects_bad_used_or_source(bad):
+    assert cp.valid_status({**entry("bob", 10), **bad}, "bob", NOW) is None
+
+
+def test_valid_status_strips_unknown_fields():
+    data = {**entry("bob", 10), "note": "[click](https://evil.example)"}
+    assert "note" not in cp.valid_status(data, "bob", NOW)
 
 
 def test_pick_peer_prefers_most_remaining_and_skips_self_stale_and_empty():
     stale = NOW - dt.timedelta(hours=1)
     statuses = [
-        {"username": "alice", "remaining": 999, "updated_at": NOW.isoformat()},
-        {"username": "bob", "remaining": 50, "updated_at": NOW.isoformat()},
-        {"username": "carol", "remaining": 200, "updated_at": stale.isoformat()},
-        {"username": "dave", "remaining": 120, "updated_at": NOW.isoformat()},
-        {"username": "erin", "remaining": 0, "updated_at": NOW.isoformat()},
+        {"username": "alice", "remaining": 999, "last_seen": NOW.isoformat()},
+        {"username": "bob", "remaining": 50, "last_seen": NOW.isoformat()},
+        {"username": "carol", "remaining": 200, "last_seen": stale.isoformat()},
+        {"username": "dave", "remaining": 120, "last_seen": NOW.isoformat()},
+        {"username": "erin", "remaining": 0, "last_seen": NOW.isoformat()},
+        {"username": "frank", "remaining": 500, "last_seen": None},
     ]
     assert cp.pick_peer(statuses, "alice", NOW, stale_after=900) == "dave"
 
@@ -293,11 +325,10 @@ def test_local_estimate_is_never_lent(tmp_path):
 
 
 def test_local_estimate_publishes_zero_lendable_credits(tmp_path):
-    gh = FakeGitHub(pool_routes())
+    gh = with_board(FakeGitHub(pool_routes()))
     make_pool(gh, tmp_path, copilot=False, quota=11900).publish_status({"alice"})
-    (_, _, body, _), = gh.called("POST", f"/repos/{POOL}/issues")
-    status = cp.extract_json_block(body["body"])
-    assert (status["remaining"], status["source"]) == (0, "local-count")
+    _, board = put_board(gh)
+    assert (board["alice"]["remaining"], board["alice"]["source"]) == (0, "local-count")
 
 
 def test_own_request_may_use_local_estimate(tmp_path):
@@ -314,8 +345,8 @@ def test_local_count_resets_each_month(tmp_path):
 
 def test_pick_peer_requires_enough_credits_for_a_review():
     statuses = [
-        {"username": "bob", "remaining": 99, "updated_at": NOW.isoformat()},
-        {"username": "carol", "remaining": 100, "updated_at": NOW.isoformat()},
+        {"username": "bob", "remaining": 99, "last_seen": NOW.isoformat()},
+        {"username": "carol", "remaining": 100, "last_seen": NOW.isoformat()},
     ]
     assert cp.pick_peer(statuses, "alice", NOW, 900, min_credits=100) == "carol"
     assert cp.pick_peer(statuses[:1], "alice", NOW, 900, min_credits=100) is None
@@ -329,7 +360,7 @@ def test_request_review_borrows_when_own_credits_below_one_review(tmp_path):
             ("POST", f"/repos/{POOL}/issues"): {"number": 9, "html_url": "u"},
         }
     )
-    gh = FakeGitHub(routes, issues={cp.STATUS_LABEL: [status_node("carol", 500, quota=11900)]})
+    gh = with_board(FakeGitHub(routes), entry("carol", 500, quota=11900))
     pool = make_pool(gh, tmp_path, used=11850, quota=11900, credits_per_review=100)
     assert "@carol" in pool.request_review(cp.parse_pr_ref("octo/repo#3"))
     assert not gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")
@@ -354,54 +385,145 @@ def test_config_migrates_monthly_quota_and_drops_unknown_keys(tmp_path):
 # --- statuses ------------------------------------------------------------------
 
 
-def test_read_statuses_drops_untrusted_and_malformed(tmp_path):
-    gh = FakeGitHub(
-        pool_routes(members=("alice", "bob", "carol", "dave", "erin")),
-        issues={
-            cp.STATUS_LABEL: [
-                status_node("bob", 10, number=1),
-                status_node("mallory", 999, number=2),
-                status_node("carol", 999, number=3, author="bob"),
-                status_node("dave", 50, number=4, editor="bob"),
-                node(5, "erin", "```json\n[1]\n```"),
-                status_node("alice", 5, number=6, editor="alice"),
-            ]
-        },
+def test_read_statuses_keeps_valid_member_rows_with_liveness(tmp_path):
+    gh = with_board(
+        FakeGitHub(),
+        entry("bob", 10),
+        entry("mallory", 99),
+        entry("carol", 999, quota=10),
+        entry("dave", 50),
+        entry("erin", 70),
+        online=["bob", "dave", "mallory"],
     )
+    gh.issues[cp.HEARTBEAT_LABEL].append(node(200, "erin", "alive", editor="bob", edited_at=NOW))
     pool = make_pool(gh, tmp_path)
-    statuses = pool.read_statuses({"alice", "bob", "carol", "dave", "erin"})
-    assert sorted(s["username"] for s in statuses) == ["alice", "bob"]
+    statuses = {s["username"]: s for s in pool.read_statuses({"alice", "bob", "carol", "dave", "erin"})}
+    assert sorted(statuses) == ["bob", "dave", "erin"]
+    assert statuses["bob"]["last_seen"] == (NOW - dt.timedelta(minutes=1)).isoformat()
+    # A heartbeat last edited by someone else doesn't count.
+    assert statuses["erin"]["last_seen"] is None
 
 
-def test_publish_status_creates_then_updates(tmp_path):
-    gh = FakeGitHub(pool_routes())
+def test_read_statuses_heartbeat_falls_back_to_creation_time(tmp_path):
+    gh = with_board(FakeGitHub(), entry("bob", 10), online=[])
+    gh.issues[cp.HEARTBEAT_LABEL] = [node(1, "bob", "alive", created_at=NOW - dt.timedelta(minutes=2))]
+    (status,) = make_pool(gh, tmp_path).read_statuses({"bob"})
+    assert status["last_seen"] == (NOW - dt.timedelta(minutes=2)).isoformat()
+
+
+@pytest.mark.parametrize("text", ["", "no json", "```json\n[1]\n```", "```json\n{bad\n```"])
+def test_read_statuses_tolerates_broken_board(tmp_path, text):
+    gh = with_board(FakeGitHub(), text=text)
+    assert make_pool(gh, tmp_path).read_statuses({"alice", "bob"}) == []
+
+
+def test_read_statuses_missing_board(tmp_path):
+    gh = FakeGitHub({BOARD: cp.GitHubError(404, "Not Found")})
+    assert make_pool(gh, tmp_path).read_statuses({"alice"}) == []
+
+
+def test_publish_status_creates_board_when_missing(tmp_path):
+    gh = FakeGitHub({**pool_routes(), BOARD: cp.GitHubError(404, "Not Found")})
+    make_pool(gh, tmp_path, used=100).publish_status({"alice"})
+    body, board = put_board(gh)
+    assert "sha" not in body
+    assert board == {"alice": entry("alice", 200, updated_at=NOW.isoformat(timespec="seconds"))}
+    text = base64.b64decode(body["content"]).decode()
+    assert "| @alice | 200 | 300 | 100 | copilot |" in text
+
+
+def test_publish_status_commits_only_when_values_change(tmp_path):
+    old = NOW - dt.timedelta(days=3)
+    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 200, used=100, updated_at=old))
     pool = make_pool(gh, tmp_path, used=100)
     pool.publish_status({"alice"})
-    (_, _, body, _), = gh.called("POST", f"/repos/{POOL}/issues")
-    status = cp.extract_json_block(body["body"])
-    assert status["remaining"] == 200
-    assert cp.valid_status(status, "alice", NOW)
-    assert body["labels"] == [cp.STATUS_LABEL]
+    assert gh.called(*BOARD_PUT) == []
 
-    gh.issues[cp.STATUS_LABEL] = [status_node("alice", 200, number=5)]
-    pool._last_published = None
+    gh.routes[("GET", cp.COPILOT_USER_ENDPOINT)] = quota_snapshot(150, 300)
+    pool.publish_status({"alice"})
+    body, board = put_board(gh)
+    assert body["sha"] == "s1"
+    assert (board["alice"]["remaining"], board["alice"]["used"]) == (150, 150)
+    assert board["alice"]["updated_at"] == NOW.isoformat(timespec="seconds")
+
+
+def test_publish_status_commits_when_quota_or_source_changes(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 200, quota=300, used=100))
+    make_pool(gh, tmp_path, used=100, quota=400).publish_status({"alice"})
+    assert len(gh.called(*BOARD_PUT)) == 1
+
+
+def test_publish_status_keeps_valid_peers_and_drops_bad_rows(tmp_path):
+    gh = with_board(
+        FakeGitHub(pool_routes()),
+        entry("bob", 10),
+        entry("gone", 10),
+        {**entry("carol", 10), "remaining": "lots"},
+    )
+    make_pool(gh, tmp_path).publish_status({"alice", "bob", "carol"})
+    _, board = put_board(gh)
+    assert sorted(board) == ["alice", "bob"]
+    assert board["bob"] == entry("bob", 10)
+
+
+def test_publish_status_rewrites_own_tampered_row(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 999, used=0, quota=999))
+    make_pool(gh, tmp_path, used=100).publish_status({"alice"})
+    _, board = put_board(gh)
+    assert board["alice"]["remaining"] == 200
+
+
+def test_publish_status_retries_on_conflict(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()))
+    attempts = []
+
+    def put(body):
+        attempts.append(body)
+        if len(attempts) == 1:
+            raise cp.GitHubError(409, "sha mismatch")
+        return {"commit": {"sha": "c"}}
+
+    gh.routes[BOARD_PUT] = put
+    make_pool(gh, tmp_path).publish_status({"alice"})
+    assert len(attempts) == 2
+
+
+def test_publish_status_gives_up_after_repeated_conflicts(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()))
+    gh.routes[BOARD_PUT] = cp.GitHubError(409, "sha mismatch")
+    with pytest.raises(cp.GitHubError):
+        make_pool(gh, tmp_path).publish_status({"alice"})
+    assert len(gh.called(*BOARD_PUT)) == 3
+
+
+def test_heartbeat_creates_then_edits_and_is_throttled(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 300, used=0), online=[])
+    pool = make_pool(gh, tmp_path)
+    pool.publish_status({"alice"})
+    (_, _, created, _), = gh.called("POST", f"/repos/{POOL}/issues")
+    assert created["labels"] == [cp.HEARTBEAT_LABEL]
+
+    gh.issues[cp.HEARTBEAT_LABEL] = [node(5, "alice", "alive")]
+    pool.publish_status({"alice"})
+    assert gh.called("PATCH", f"/repos/{POOL}/issues/5") == []
+    pool._last_heartbeat = NOW - dt.timedelta(minutes=10)
     pool.publish_status({"alice"})
     assert gh.called("PATCH", f"/repos/{POOL}/issues/5")
+    assert len(gh.called("POST", f"/repos/{POOL}/issues")) == 1
 
 
-def test_publish_status_overwrites_own_tampered_issue(tmp_path):
-    gh = FakeGitHub(pool_routes(), issues={cp.STATUS_LABEL: [status_node("alice", 999, number=5, editor="bob")]})
+def test_heartbeat_overwrites_own_tampered_issue(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 300, used=0), online=[])
+    gh.issues[cp.HEARTBEAT_LABEL] = [node(5, "alice", "x", editor="bob")]
     make_pool(gh, tmp_path).publish_status({"alice", "bob"})
     assert gh.called("PATCH", f"/repos/{POOL}/issues/5")
     assert not gh.called("POST", f"/repos/{POOL}/issues")
 
 
-def test_publish_status_skips_when_unchanged_within_heartbeat(tmp_path):
-    gh = FakeGitHub(pool_routes())
-    pool = make_pool(gh, tmp_path)
-    pool.publish_status({"alice"})
-    pool.publish_status({"alice"})
-    assert len(gh.called("POST", f"/repos/{POOL}/issues")) == 1
+def test_retire_legacy_status_issues_closes_only_own(tmp_path):
+    gh = FakeGitHub(issues={cp.LEGACY_STATUS_LABEL: [node(1, "alice", "old"), node(2, "bob", "old")]})
+    make_pool(gh, tmp_path).retire_legacy_status_issues()
+    assert [c[1] for c in gh.calls if c[0] == "PATCH"] == [f"/repos/{POOL}/issues/1"]
 
 
 # --- invitations ---------------------------------------------------------------
@@ -458,7 +580,7 @@ def test_request_review_borrows_from_richest_peer_and_records_invite(tmp_path):
             ("POST", f"/repos/{POOL}/issues"): {"number": 9, "html_url": "https://github.com/team/pool/issues/9"},
         }
     )
-    gh = FakeGitHub(routes, issues={cp.STATUS_LABEL: [status_node("bob", 10, number=1), status_node("carol", 90, number=2)]})
+    gh = with_board(FakeGitHub(routes), entry("bob", 10), entry("carol", 90))
     pool = make_pool(gh, tmp_path, used=300)
     msg = pool.request_review(cp.parse_pr_ref("octo/repo#3"))
 
@@ -482,7 +604,7 @@ def test_request_review_skips_invite_when_peer_has_access(tmp_path):
             ("POST", f"/repos/{POOL}/issues"): {"number": 9, "html_url": "u"},
         }
     )
-    gh = FakeGitHub(routes, issues={cp.STATUS_LABEL: [status_node("bob", 10)]})
+    gh = with_board(FakeGitHub(routes), entry("bob", 10))
     pool = make_pool(gh, tmp_path, used=300)
     pool.request_review(cp.parse_pr_ref("octo/repo#3"))
     assert not gh.called("PUT", "/repos/octo/repo/collaborators/bob")
@@ -497,7 +619,7 @@ def test_invite_omits_permission_for_personal_repo():
 
 
 def test_request_review_fails_when_nobody_has_credits(tmp_path):
-    gh = FakeGitHub(pool_routes(), issues={cp.STATUS_LABEL: [status_node("bob", 0)]})
+    gh = with_board(FakeGitHub(pool_routes()), entry("bob", 0))
     with pytest.raises(SystemExit):
         make_pool(gh, tmp_path, used=300).request_review(cp.parse_pr_ref("octo/repo#3"))
 
@@ -783,7 +905,7 @@ def borrow_routes(issue_resp):
             ("DELETE", "/repos/octo/repo/collaborators/carol"): cp.GitHubError(404, "Not Found"),
         }
     )
-    return FakeGitHub(routes, issues={cp.STATUS_LABEL: [status_node("carol", 90)]})
+    return with_board(FakeGitHub(routes), entry("carol", 90))
 
 
 def test_request_review_records_invite_before_granting(tmp_path):
@@ -876,10 +998,10 @@ def test_run_once_reloads_state_written_by_other_process(tmp_path):
 def test_run_once_survives_malformed_status_from_a_member(tmp_path):
     gh = FakeGitHub(
         {**pool_routes(), ("GET", "/user/repository_invitations"): []},
-        issues={cp.STATUS_LABEL: [node(1, "bob", "```json\n[1]\n```")]},
     )
+    with_board(gh, text="```json\n[1]\n```")
     make_pool(gh, tmp_path).run_once()
-    assert gh.called("POST", f"/repos/{POOL}/issues")
+    assert gh.called(*BOARD_PUT)
     assert gh.called("GET", "/user/repository_invitations")
 
 

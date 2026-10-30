@@ -2,7 +2,8 @@
 """Share GitHub Copilot code-review credits among people who trust each other.
 
 Coordination happens through a shared private "pool" repository:
-  * each member's daemon keeps a `pool-status` issue updated with its remaining credits
+  * README.md holds every member's credits; each daemon commits its own row only when it changes
+  * each daemon edits its own `pool-heartbeat` issue periodically so others know it is online
   * a review request is a `copilot-request` issue assigned to the chosen helper
 
 Commands:
@@ -13,6 +14,7 @@ Commands:
 """
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import fcntl
@@ -35,7 +37,12 @@ from pathlib import Path
 API = "https://api.github.com"
 COPILOT_REVIEWER = "copilot-pull-request-reviewer[bot]"
 REQUEST_LABEL = "copilot-request"
-STATUS_LABEL = "pool-status"
+HEARTBEAT_LABEL = "pool-heartbeat"
+# Status issues from before the board moved to README.md; retired on startup.
+LEGACY_STATUS_LABEL = "pool-status"
+BOARD_PATH = "README.md"
+STATUS_SOURCES = {"copilot", "local-count"}
+STATUS_FIELDS = ("remaining", "quota", "used", "source")
 REVIEW_ROLES = {"triage", "write", "maintain", "admin"}
 # Undocumented endpoint the Copilot clients use; the only one that reports credits for org-paid seats too.
 COPILOT_USER_ENDPOINT = "/copilot_internal/user"
@@ -58,6 +65,7 @@ query($owner: String!, $name: String!, $labels: [String!], $states: [IssueState!
         number
         body
         createdAt
+        lastEditedAt
         author { login }
         editor { login }
         assignees(first: 10) { nodes { login } }
@@ -295,11 +303,13 @@ def is_int(value):
 
 
 def valid_status(data, author, now):
-    """Return the status if it is well-formed and plausible, else None."""
+    """Return a cleaned copy of the status if it is well-formed and plausible, else None."""
     if not isinstance(data, dict) or data.get("username") != author:
         return None
-    remaining, quota = data.get("remaining"), data.get("quota")
-    if not (is_int(remaining) and is_int(quota) and 0 <= remaining <= quota):
+    remaining, quota, used = data.get("remaining"), data.get("quota"), data.get("used")
+    if not (is_int(remaining) and is_int(quota) and is_int(used) and 0 <= remaining <= quota and used >= 0):
+        return None
+    if data.get("source") not in STATUS_SOURCES:
         return None
     try:
         updated = parse_time(data["updated_at"])
@@ -308,7 +318,26 @@ def valid_status(data, author, now):
     # A timestamp in the future would keep a status "fresh" forever.
     if updated.tzinfo is None or updated > now + CLOCK_SKEW:
         return None
-    return data
+    # Only known fields survive, since the board re-renders other members' rows into markdown.
+    return {"username": author, **{k: data[k] for k in STATUS_FIELDS}, "updated_at": data["updated_at"]}
+
+
+def render_board(board):
+    lines = [
+        "# Copilot credit pool",
+        "",
+        "Maintained by copilot_pool.py. Each member's script rewrites its own row when its credits change.",
+        "",
+        "| Member | Credits left | Monthly | Used | Source | Changed (UTC) |",
+        "|---|--:|--:|--:|---|---|",
+    ]
+    for user in sorted(board, key=str.lower):
+        row = board[user]
+        lines.append(
+            f"| @{user} | {row['remaining']} | {row['quota']} | {row['used']} | {row['source']} | {row['updated_at']} |"
+        )
+    lines += ["", "<details><summary>Data read by the scripts</summary>", "", json_block(board), "", "</details>", ""]
+    return "\n".join(lines)
 
 
 def request_pr(issue):
@@ -329,13 +358,14 @@ def edited_by_author(issue):
 
 
 def pick_peer(statuses, me, now, stale_after, min_credits=1):
-    """Pick the fresh, non-self member with the most remaining credits, if they can afford a review."""
+    """Pick the online, non-self member with the most remaining credits, if they can afford a review."""
     candidates = [
         s
         for s in statuses
         if s["username"] != me
         and s["remaining"] >= min_credits
-        and (now - parse_time(s["updated_at"])).total_seconds() <= stale_after
+        and s.get("last_seen")
+        and (now - parse_time(s["last_seen"])).total_seconds() <= stale_after
     ]
     if not candidates:
         return None
@@ -375,7 +405,7 @@ class Pool:
         self.state = state
         self.state_path = state_path
         self.clock = clock
-        self._last_published = None
+        self._last_heartbeat = None
         self._pool_repo_info = None
 
     @property
@@ -430,6 +460,7 @@ class Pool:
                         "number": node["number"],
                         "body": node["body"],
                         "created_at": node["createdAt"],
+                        "edited_at": node.get("lastEditedAt"),
                         "author": (node.get("author") or {}).get("login"),
                         "editor": (node.get("editor") or {}).get("login"),
                         "assignees": [a["login"] for a in node["assignees"]["nodes"]],
@@ -473,48 +504,100 @@ class Pool:
             state.roll_month(self.clock())
             state.requested_count += 1
 
+    def read_board(self):
+        """Return (board dict, file sha or None). A missing or unparseable board reads as empty."""
+        try:
+            resp = self.gh.request("GET", f"/repos/{self.cfg.pool_repo}/contents/{BOARD_PATH}")
+        except GitHubError as e:
+            if e.status == 404:
+                return {}, None
+            raise
+        try:
+            text = base64.b64decode(resp["content"]).decode()
+        except (KeyError, TypeError, ValueError):
+            return {}, resp.get("sha")
+        board = extract_json_block(text)
+        return (board if isinstance(board, dict) else {}), resp.get("sha")
+
+    def last_seen(self, members):
+        """member -> when GitHub last saw them edit their heartbeat issue."""
+        seen = {}
+        for issue in self.pool_issues(HEARTBEAT_LABEL):
+            author = issue["author"]
+            if author in members and edited_by_author(issue):
+                # GitHub's own timestamp; members can't backdate or future-date it.
+                stamp = issue["edited_at"] or issue["created_at"]
+                if author not in seen or parse_time(stamp) > parse_time(seen[author]):
+                    seen[author] = stamp
+        return seen
+
     def read_statuses(self, members):
         now = self.clock()
+        board, _ = self.read_board()
+        seen = self.last_seen(members)
         statuses = []
-        for issue in self.pool_issues(STATUS_LABEL):
-            if issue["author"] not in members or not edited_by_author(issue):
-                continue
-            status = valid_status(extract_json_block(issue["body"]), issue["author"], now)
+        for user, entry in board.items():
+            # Commit authorship is spoofable, so rows aren't attributable; helpers re-check credits themselves.
+            status = valid_status(entry, user, now) if user in members else None
             if status:
-                statuses.append({**status, "issue_number": issue["number"]})
+                statuses.append({**status, "last_seen": seen.get(user)})
         return statuses
 
     def publish_status(self, members):
         used, quota, source = self.usage()
-        remaining = max(0, quota - used) if source == "copilot" else 0
+        mine = {"remaining": max(0, quota - used) if source == "copilot" else 0, "quota": quota, "used": used, "source": source}
+        for attempt in range(3):
+            board, sha = self.read_board()
+            current = board.get(self.me)
+            if isinstance(current, dict) and all(current.get(k) == mine[k] for k in STATUS_FIELDS):
+                break
+            now = self.clock()
+            # Rebuild from validated rows only, so a malformed or departed member's row doesn't persist.
+            cleaned = {u: valid_status(e, u, now) for u, e in board.items() if u in members and u != self.me}
+            cleaned = {u: e for u, e in cleaned.items() if e}
+            cleaned[self.me] = {"username": self.me, **mine, "updated_at": now.isoformat(timespec="seconds")}
+            body = {
+                "message": f"Update @{self.me}: {mine['remaining']} credits left",
+                "content": base64.b64encode(render_board(cleaned).encode()).decode(),
+            }
+            if sha:
+                body["sha"] = sha
+            try:
+                self.gh.request("PUT", f"/repos/{self.cfg.pool_repo}/contents/{BOARD_PATH}", body)
+                log.info("Board updated: %s", cleaned[self.me])
+                break
+            except GitHubError as e:
+                # 409: another member committed since we read the board.
+                if e.status not in (409, 422) or attempt == 2:
+                    raise
+        self.heartbeat()
+
+    def heartbeat(self):
         now = self.clock()
-        if (
-            self._last_published
-            and self._last_published[0] == remaining
-            and (now - self._last_published[1]).total_seconds() < self.cfg.heartbeat_interval
-        ):
+        if self._last_heartbeat and (now - self._last_heartbeat).total_seconds() < self.cfg.heartbeat_interval:
             return
-        status = {
-            "username": self.me,
-            "remaining": remaining,
-            "quota": quota,
-            "used": used,
-            "source": source,
-            "updated_at": now.isoformat(timespec="seconds"),
-        }
-        body = f"Copilot credit status for @{self.me}, maintained by copilot_pool.py.\n\n{json_block(status)}"
-        # Match by author alone so a status someone else tampered with gets overwritten, not duplicated.
-        mine = [i for i in self.pool_issues(STATUS_LABEL) if i["author"] == self.me]
+        body = f"@{self.me}'s copilot_pool.py was running at {now.isoformat(timespec='seconds')}."
+        # Match by author alone so a heartbeat someone else tampered with gets overwritten, not duplicated.
+        mine = [i for i in self.pool_issues(HEARTBEAT_LABEL) if i["author"] == self.me]
         if mine:
             self.gh.request("PATCH", f"/repos/{self.cfg.pool_repo}/issues/{mine[0]['number']}", {"body": body})
         else:
             self.gh.request(
                 "POST",
                 f"/repos/{self.cfg.pool_repo}/issues",
-                {"title": f"pool-status: {self.me}", "body": body, "labels": [STATUS_LABEL]},
+                {"title": f"pool-heartbeat: {self.me}", "body": body, "labels": [HEARTBEAT_LABEL]},
             )
-        self._last_published = (remaining, now)
-        log.debug("Published status: %s", status)
+        self._last_heartbeat = now
+
+    def retire_legacy_status_issues(self):
+        for issue in self.pool_issues(LEGACY_STATUS_LABEL):
+            if issue["author"] == self.me:
+                self.gh.request(
+                    "PATCH",
+                    f"/repos/{self.cfg.pool_repo}/issues/{issue['number']}",
+                    {"state": "closed", "state_reason": "completed"},
+                )
+                log.info("Closed legacy status issue #%s; status now lives in %s", issue["number"], BOARD_PATH)
 
     def accept_invitations(self, members, open_requests):
         """Accept an invite only if its inviter has an open request for a PR in that repo."""
@@ -766,7 +849,7 @@ class Pool:
 
 
 def ensure_labels(gh, repo):
-    for name, color in ((REQUEST_LABEL, "8250df"), (STATUS_LABEL, "0e8a16")):
+    for name, color in ((REQUEST_LABEL, "8250df"), (HEARTBEAT_LABEL, "0e8a16")):
         try:
             gh.request("POST", f"/repos/{repo}/labels", {"name": name, "color": color})
         except GitHubError as e:
@@ -826,6 +909,11 @@ def build_pool():
 
 def cmd_run(args):
     pool = build_pool()
+    ensure_labels(pool.gh, pool.cfg.pool_repo)
+    try:
+        pool.retire_legacy_status_issues()
+    except GitHubError as e:
+        log.warning("Couldn't close legacy status issues: %s", e)
     log.info("Serving pool %s as %s every %ss", pool.cfg.pool_repo, pool.me, pool.cfg.poll_interval)
     while True:
         try:
@@ -844,11 +932,14 @@ def cmd_status(args):
     pool = build_pool()
     now = pool.clock()
     statuses = sorted(pool.read_statuses(pool.members()), key=lambda s: -s["remaining"])
-    print(f"{'member':<24}{'credits left':>13}{'monthly':>9}  {'source':<12}last seen")
+    print(f"{'member':<24}{'credits left':>13}{'monthly':>9}  {'source':<12}{'changed':<26}last seen")
     for s in statuses:
-        age = int((now - parse_time(s["updated_at"])).total_seconds())
-        stale = " (stale)" if age > pool.cfg.stale_after else ""
-        print(f"{s['username']:<24}{s['remaining']:>13}{s['quota']:>9}  {s.get('source', '?'):<12}{age}s ago{stale}")
+        if s["last_seen"]:
+            age = int((now - parse_time(s["last_seen"])).total_seconds())
+            seen = f"{age}s ago" + (" (offline)" if age > pool.cfg.stale_after else "")
+        else:
+            seen = "never (offline)"
+        print(f"{s['username']:<24}{s['remaining']:>13}{s['quota']:>9}  {s['source']:<12}{s['updated_at']:<26}{seen}")
 
 
 def main(argv=None):

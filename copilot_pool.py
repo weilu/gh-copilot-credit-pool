@@ -167,6 +167,8 @@ class Config:
     max_requests_per_requester_per_day: int = 10
     # How long after a request completes to wait for Copilot's review before revoking the helper's access.
     review_grace: int = 3600
+    # Local floor on credits left before lending; the shared pool.json value can raise it but never lower it.
+    min_credits_to_lend: int = 0
 
     @classmethod
     def load(cls, path):
@@ -174,6 +176,9 @@ class Config:
         # Configs from before the switch to credits.
         if "monthly_quota" in data:
             data.setdefault("monthly_credits", data.pop("monthly_quota"))
+        # Configs from when credits_per_review was per member: keep it as this member's own floor.
+        if "credits_per_review" in data:
+            data.setdefault("min_credits_to_lend", data.pop("credits_per_review"))
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
 
@@ -431,6 +436,7 @@ class Pool:
         self.gh = gh
         self._warned_fallback = False
         self._credits_per_review = None
+        self._last_seen_credits_per_review = None
         self.state = state
         self.state_path = state_path
         self.clock = clock
@@ -518,7 +524,21 @@ class Pool:
                 log.warning("Ignoring credits_per_review=%r in %s; using %s", value, SETTINGS_PATH, DEFAULT_CREDITS_PER_REVIEW)
                 value = None
             self._credits_per_review = DEFAULT_CREDITS_PER_REVIEW if value is None else value
+            previous = self._last_seen_credits_per_review
+            if previous is not None and previous != self._credits_per_review:
+                log.warning(
+                    "Pool credits_per_review changed from %s to %s (your min_credits_to_lend is %s)",
+                    previous,
+                    self._credits_per_review,
+                    self.cfg.min_credits_to_lend,
+                )
+            self._last_seen_credits_per_review = self._credits_per_review
         return self._credits_per_review
+
+    @property
+    def lending_floor(self):
+        """Credits this member must have left to serve a request; members can only make it stricter."""
+        return max(self.cfg.min_credits_to_lend, self.credits_per_review)
 
     def usage(self):
         """Return (credits used this month, monthly credits, source)."""
@@ -595,7 +615,11 @@ class Pool:
 
     def publish_status(self, members):
         used, quota, source = self.usage()
-        mine = {"remaining": max(0, quota - used) if source == "copilot" else 0, "quota": quota, "used": used, "source": source}
+        remaining = max(0, quota - used) if source == "copilot" else 0
+        # Below our own floor we'd decline anyway, so don't invite requests.
+        if remaining < self.cfg.min_credits_to_lend:
+            remaining = 0
+        mine = {"remaining": remaining, "quota": quota, "used": used, "source": source}
         for attempt in range(3):
             board, sha = self.read_board()
             now = self.clock()
@@ -725,7 +749,7 @@ class Pool:
                 "not_planned",
             )
             return
-        if self.lendable() < self.credits_per_review:
+        if self.lendable() < self.lending_floor:
             self._close(
                 number,
                 f"@{requester} sorry, @{self.me} doesn't have enough Copilot credits left for a review. Run `request` again to pick someone else.",

@@ -38,7 +38,8 @@ the token. The default `gh` login includes the `repo` scope it needs.
 Your files live in `~/.config/copilot-pool/`. Set `COPILOT_POOL_HOME` to use a different directory.
 - `config.json` (mode 600) holds your settings. You can also edit `poll_interval` (60s),
   `heartbeat_interval` (5 min), `stale_after` (15 min), `access_timeout` (1h) and `review_grace` (1h)
-  there.
+  there, along with `min_credits_to_lend` (0), your own floor described under
+  [Pool settings](#pool-settings).
 - `state.json` is the script's own bookkeeping: invites it still has to revoke, requests it has
   served, and its heartbeat issue number.
 
@@ -65,7 +66,13 @@ it every cycle.
 - `credits_per_review` is the least a member must have left to take a review, or to use their own
   credits. It is also the cost per review in the local estimate (see [Credits](#credits)). Lower it
   once you know what a review actually costs. Anything other than a whole number from 1 to 1,000,000,
-  or a missing or unreadable file, means 100.
+  or a missing or unreadable file, means 100. Your script logs a warning when the value changes.
+
+Each member can also set `min_credits_to_lend` in their own `config.json`. You then lend only while
+you have at least the larger of that and `credits_per_review` left. Below your floor you advertise 0
+credits, so nobody picks you. The shared value can make you stricter but can never make you lend
+below your own floor. A `credits_per_review` left in an older `config.json` is kept as
+`min_credits_to_lend`.
 
 ## Credits
 
@@ -124,7 +131,8 @@ that.
   `credits_per_review` for everyone. Raising it only makes helpers more selective. Lowering it lets
   helpers with very few credits left accept reviews. If a review then costs more than they have
   left, it fails, or, on a seat that allows spending beyond the allowance, it is billed as overage
-  to that member or their organization.
+  to that member or their organization. If you're on such a seat, set `min_credits_to_lend` in your
+  own config: the shared value can't go below it.
 
 Apart from `pool.json`, tampering can at worst send a request to the wrong member or keep someone
 from being picked. The helper's own script still checks its real credits, the rate limit and the
@@ -137,7 +145,7 @@ On first `run`, the script closes the member's old `pool-status` issue from earl
 - Collaborator access is revoked by the requester's running script, so keep `run` running after `request`.
 - Org-paid seats: check that your organization allows lending its Copilot credits to outsiders.
 - Org repos may block outside collaborators. Copilot code review also has to be enabled for the helper.
-- A helper without `credits_per_review` credits left declines the request. Run `request` again to pick the next member.
+- A helper below its lending floor (`credits_per_review`, or its own higher `min_credits_to_lend`) declines the request. Run `request` again to pick the next member.
 
 ## Tests
 

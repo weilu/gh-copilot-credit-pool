@@ -457,6 +457,60 @@ def test_config_migrates_monthly_quota_and_drops_unknown_keys(tmp_path):
     assert cfg.monthly_credits == 300
     assert not hasattr(cfg, "billing_token")
     assert not hasattr(cfg, "credits_per_review")
+    assert cfg.min_credits_to_lend == 5
+
+
+def test_config_min_credits_to_lend_defaults_to_zero(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"username": "a", "pool_repo": POOL, "monthly_credits": 300}))
+    assert cp.Config.load(path).min_credits_to_lend == 0
+
+
+@pytest.mark.parametrize(
+    "local_floor, pool_value, remaining, serves",
+    [
+        (0, 100, 100, True),
+        (0, 100, 99, False),
+        (500, 100, 499, False),  # local floor stricter than pool
+        (500, 100, 500, True),
+        (500, 1, 499, False),  # pool lowered to 1 can't undercut the local floor
+        (50, 200, 199, False),  # pool stricter than local floor
+    ],
+)
+def test_helper_uses_stricter_of_local_and_pool_floor(tmp_path, local_floor, pool_value, remaining, serves):
+    gh = helper_gh()
+    pool = make_pool(
+        gh, tmp_path, me="bob", used=11900 - remaining, quota=11900,
+        credits_per_review=pool_value, min_credits_to_lend=local_floor,
+    )
+    pool.handle_request(as_issue(request_node()), MEMBERS)
+    assert bool(gh.called("POST", "/repos/octo/repo/pulls/3/requested_reviewers")) is serves
+
+
+def test_member_below_own_floor_advertises_zero(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()))
+    make_pool(gh, tmp_path, used=11500, quota=11900, min_credits_to_lend=500).publish_status({"alice"})
+    _, board = put_board(gh)
+    assert board["alice"]["remaining"] == 0
+    assert board["alice"]["used"] == 11500
+
+
+def test_member_at_or_above_own_floor_advertises_real_remaining(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()))
+    make_pool(gh, tmp_path, used=11400, quota=11900, min_credits_to_lend=500).publish_status({"alice"})
+    _, board = put_board(gh)
+    assert board["alice"]["remaining"] == 500
+
+
+def test_pool_credits_per_review_change_is_logged(tmp_path, caplog):
+    gh = FakeGitHub({**pool_routes(), SETTINGS: settings_resp({"credits_per_review": 100}), ("GET", "/user/repository_invitations"): []})
+    pool = make_pool(gh, tmp_path)
+    assert pool.credits_per_review == 100
+    gh.routes[SETTINGS] = settings_resp({"credits_per_review": 1})
+    pool._credits_per_review = None
+    with caplog.at_level("WARNING", logger="copilot-pool"):
+        assert pool.credits_per_review == 1
+    assert "changed from 100 to 1" in caplog.text
 
 
 # --- statuses ------------------------------------------------------------------

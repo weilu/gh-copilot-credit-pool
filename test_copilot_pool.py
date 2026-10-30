@@ -39,9 +39,10 @@ class FakeGitHub:
         return [c for c in self.calls if c[0] == method and c[1] == path]
 
 
-def node(number, author, body, editor=None, assignees=(), created_at=NOW, edited_at=None):
+def node(number, author, body, editor=None, assignees=(), created_at=NOW, edited_at=None, title=None):
     return {
         "number": number,
+        "title": title if title is not None else f"issue {number}",
         "body": body,
         "createdAt": created_at.isoformat(),
         "lastEditedAt": edited_at.isoformat() if edited_at else None,
@@ -73,9 +74,13 @@ def with_board(gh, *entries, online=None, text=None, sha="s1"):
     gh.routes[BOARD] = {"content": base64.b64encode(text.encode()).decode(), "sha": sha}
     users = [e["username"] for e in entries] if online is None else online
     gh.issues[cp.HEARTBEAT_LABEL] = [
-        node(100 + i, u, "alive", edited_at=NOW - dt.timedelta(minutes=1)) for i, u in enumerate(users)
+        heartbeat_node(100 + i, u, edited_at=NOW - dt.timedelta(minutes=1)) for i, u in enumerate(users)
     ]
     return gh
+
+
+def heartbeat_node(number, user, **kw):
+    return node(number, user, "alive", title=f"pool-heartbeat: {user}", **kw)
 
 
 def put_board(gh, index=-1):
@@ -93,6 +98,7 @@ def as_issue(n):
     """Convert a GraphQL node to the dict shape Pool.pool_issues returns."""
     return {
         "number": n["number"],
+        "title": n["title"],
         "body": n["body"],
         "created_at": n["createdAt"],
         "author": (n["author"] or {}).get("login"),
@@ -395,7 +401,7 @@ def test_read_statuses_keeps_valid_member_rows_with_liveness(tmp_path):
         entry("erin", 70),
         online=["bob", "dave", "mallory"],
     )
-    gh.issues[cp.HEARTBEAT_LABEL].append(node(200, "erin", "alive", editor="bob", edited_at=NOW))
+    gh.issues[cp.HEARTBEAT_LABEL].append(heartbeat_node(200, "erin", editor="bob", edited_at=NOW))
     pool = make_pool(gh, tmp_path)
     statuses = {s["username"]: s for s in pool.read_statuses({"alice", "bob", "carol", "dave", "erin"})}
     assert sorted(statuses) == ["bob", "dave", "erin"]
@@ -406,7 +412,7 @@ def test_read_statuses_keeps_valid_member_rows_with_liveness(tmp_path):
 
 def test_read_statuses_heartbeat_falls_back_to_creation_time(tmp_path):
     gh = with_board(FakeGitHub(), entry("bob", 10), online=[])
-    gh.issues[cp.HEARTBEAT_LABEL] = [node(1, "bob", "alive", created_at=NOW - dt.timedelta(minutes=2))]
+    gh.issues[cp.HEARTBEAT_LABEL] = [heartbeat_node(1, "bob", created_at=NOW - dt.timedelta(minutes=2))]
     (status,) = make_pool(gh, tmp_path).read_statuses({"bob"})
     assert status["last_seen"] == (NOW - dt.timedelta(minutes=2)).isoformat()
 
@@ -497,27 +503,73 @@ def test_publish_status_gives_up_after_repeated_conflicts(tmp_path):
 
 
 def test_heartbeat_creates_then_edits_and_is_throttled(tmp_path):
-    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 300, used=0), online=[])
+    gh = FakeGitHub(pool_routes())
     pool = make_pool(gh, tmp_path)
-    pool.publish_status({"alice"})
+    pool.heartbeat()
     (_, _, created, _), = gh.called("POST", f"/repos/{POOL}/issues")
     assert created["labels"] == [cp.HEARTBEAT_LABEL]
+    assert created["title"] == "pool-heartbeat: alice"
 
-    gh.issues[cp.HEARTBEAT_LABEL] = [node(5, "alice", "alive")]
-    pool.publish_status({"alice"})
+    gh.issues[cp.HEARTBEAT_LABEL] = [heartbeat_node(5, "alice")]
+    pool.heartbeat()
     assert gh.called("PATCH", f"/repos/{POOL}/issues/5") == []
     pool._last_heartbeat = NOW - dt.timedelta(minutes=10)
-    pool.publish_status({"alice"})
+    pool.heartbeat()
     assert gh.called("PATCH", f"/repos/{POOL}/issues/5")
     assert len(gh.called("POST", f"/repos/{POOL}/issues")) == 1
 
 
 def test_heartbeat_overwrites_own_tampered_issue(tmp_path):
-    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 300, used=0), online=[])
-    gh.issues[cp.HEARTBEAT_LABEL] = [node(5, "alice", "x", editor="bob")]
-    make_pool(gh, tmp_path).publish_status({"alice", "bob"})
+    gh = FakeGitHub(pool_routes())
+    gh.issues[cp.HEARTBEAT_LABEL] = [heartbeat_node(5, "alice", editor="bob")]
+    make_pool(gh, tmp_path).heartbeat()
     assert gh.called("PATCH", f"/repos/{POOL}/issues/5")
     assert not gh.called("POST", f"/repos/{POOL}/issues")
+
+
+def test_heartbeat_ignores_relabelled_issues(tmp_path):
+    gh = FakeGitHub(pool_routes())
+    # Someone put the heartbeat label on one of alice's other issues.
+    gh.issues[cp.HEARTBEAT_LABEL] = [node(9, "alice", "a request", title="Copilot review: octo/repo#3", edited_at=NOW)]
+    pool = make_pool(gh, tmp_path)
+    assert pool.last_seen({"alice"}) == {}
+    pool.heartbeat()
+    assert not gh.called("PATCH", f"/repos/{POOL}/issues/9")
+    assert gh.called("POST", f"/repos/{POOL}/issues")
+
+
+def test_board_failure_does_not_suppress_heartbeat(tmp_path):
+    gh = FakeGitHub({**pool_routes(), BOARD: cp.GitHubError(500, "boom"), ("GET", "/user/repository_invitations"): []})
+    make_pool(gh, tmp_path).run_once()
+    (_, _, created, _), = gh.called("POST", f"/repos/{POOL}/issues")
+    assert created["labels"] == [cp.HEARTBEAT_LABEL]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, [], {}, ["copilot"], {"a": 1}, 1.5, True, "x", -1, 10**30, float("nan")],
+)
+@pytest.mark.parametrize("key", ["username", "remaining", "quota", "used", "source", "updated_at"])
+def test_valid_status_never_raises_on_odd_values(key, value):
+    result = cp.valid_status({**entry("bob", 10), key: value}, "bob", NOW)
+    assert result is None or set(result) == {"username", *cp.STATUS_FIELDS, "updated_at"}
+
+
+def test_unhashable_source_in_peer_row_does_not_break_pool(tmp_path):
+    gh = with_board(FakeGitHub(pool_routes()), entry("bob", 10), {**entry("carol", 20), "source": ["copilot"]})
+    pool = make_pool(gh, tmp_path)
+    assert [s["username"] for s in pool.read_statuses({"alice", "bob", "carol"})] == ["bob"]
+    pool.publish_status({"alice", "bob", "carol"})
+    _, board = put_board(gh)
+    assert sorted(board) == ["alice", "bob"]
+
+
+def test_publish_status_repairs_own_row_with_bad_timestamp(tmp_path):
+    future = NOW + dt.timedelta(days=30)
+    gh = with_board(FakeGitHub(pool_routes()), entry("alice", 200, used=100, updated_at=future))
+    make_pool(gh, tmp_path, used=100).publish_status({"alice"})
+    _, board = put_board(gh)
+    assert board["alice"]["updated_at"] == NOW.isoformat(timespec="seconds")
 
 
 def test_retire_legacy_status_issues_closes_only_own(tmp_path):

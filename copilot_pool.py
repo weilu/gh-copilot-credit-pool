@@ -63,6 +63,7 @@ query($owner: String!, $name: String!, $labels: [String!], $states: [IssueState!
       pageInfo { hasNextPage endCursor }
       nodes {
         number
+        title
         body
         createdAt
         lastEditedAt
@@ -309,7 +310,9 @@ def valid_status(data, author, now):
     remaining, quota, used = data.get("remaining"), data.get("quota"), data.get("used")
     if not (is_int(remaining) and is_int(quota) and is_int(used) and 0 <= remaining <= quota and used >= 0):
         return None
-    if data.get("source") not in STATUS_SOURCES:
+    source = data.get("source")
+    # Type check first: an unhashable value (list/dict) would raise on the set lookup.
+    if not isinstance(source, str) or source not in STATUS_SOURCES:
         return None
     try:
         updated = parse_time(data["updated_at"])
@@ -349,6 +352,11 @@ def request_pr(issue):
         return parse_pr_ref(payload.get("pr"))
     except ValueError:
         return None
+
+
+def is_own_heartbeat(issue):
+    # The label alone isn't attributable (anyone can label any issue), so also require the title we create.
+    return issue["author"] is not None and issue.get("title") == f"pool-heartbeat: {issue['author']}"
 
 
 def edited_by_author(issue):
@@ -458,6 +466,7 @@ class Pool:
                 issues.append(
                     {
                         "number": node["number"],
+                        "title": node.get("title"),
                         "body": node["body"],
                         "created_at": node["createdAt"],
                         "edited_at": node.get("lastEditedAt"),
@@ -524,7 +533,7 @@ class Pool:
         seen = {}
         for issue in self.pool_issues(HEARTBEAT_LABEL):
             author = issue["author"]
-            if author in members and edited_by_author(issue):
+            if author in members and edited_by_author(issue) and is_own_heartbeat(issue):
                 # GitHub's own timestamp; members can't backdate or future-date it.
                 stamp = issue["edited_at"] or issue["created_at"]
                 if author not in seen or parse_time(stamp) > parse_time(seen[author]):
@@ -548,10 +557,12 @@ class Pool:
         mine = {"remaining": max(0, quota - used) if source == "copilot" else 0, "quota": quota, "used": used, "source": source}
         for attempt in range(3):
             board, sha = self.read_board()
-            current = board.get(self.me)
-            if isinstance(current, dict) and all(current.get(k) == mine[k] for k in STATUS_FIELDS):
-                break
             now = self.clock()
+            # Validate the whole row, not just the numbers: a tampered timestamp or username would make
+            # readers drop it while the values still look current.
+            current = valid_status(board.get(self.me), self.me, now)
+            if current and all(current[k] == mine[k] for k in STATUS_FIELDS):
+                break
             # Rebuild from validated rows only, so a malformed or departed member's row doesn't persist.
             cleaned = {u: valid_status(e, u, now) for u, e in board.items() if u in members and u != self.me}
             cleaned = {u: e for u, e in cleaned.items() if e}
@@ -570,7 +581,6 @@ class Pool:
                 # 409: another member committed since we read the board.
                 if e.status not in (409, 422) or attempt == 2:
                     raise
-        self.heartbeat()
 
     def heartbeat(self):
         now = self.clock()
@@ -578,7 +588,7 @@ class Pool:
             return
         body = f"@{self.me}'s copilot_pool.py was running at {now.isoformat(timespec='seconds')}."
         # Match by author alone so a heartbeat someone else tampered with gets overwritten, not duplicated.
-        mine = [i for i in self.pool_issues(HEARTBEAT_LABEL) if i["author"] == self.me]
+        mine = [i for i in self.pool_issues(HEARTBEAT_LABEL) if i["author"] == self.me and is_own_heartbeat(i)]
         if mine:
             self.gh.request("PATCH", f"/repos/{self.cfg.pool_repo}/issues/{mine[0]['number']}", {"body": body})
         else:
@@ -836,6 +846,8 @@ class Pool:
         open_requests = self.pool_issues(REQUEST_LABEL)
         steps = (
             (self.publish_status, (members,)),
+            # Separate step so a board failure can't make this member look offline.
+            (self.heartbeat, ()),
             (self.accept_invitations, (members, open_requests)),
             (self.serve_requests, (members, open_requests)),
             (self.cleanup_invites, (open_requests,)),
